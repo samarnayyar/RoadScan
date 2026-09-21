@@ -1,0 +1,15 @@
+include: package:flutter_lints/flutter.yaml
+
+analyzer:
+  errors:
+    # Unawaited futures in fire-and-forget paths (warming the model, kicking
+    # off a refresh) are intentional here, not oversights.
+    unawaited_futures: ignore
+  exclude:
+    - build/**
+    - android/**
+
+linter:
+  rules:
+    prefer_single_quotes: true
+    require_trailing_commas: false

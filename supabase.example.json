@@ -1,0 +1,6 @@
+{
+  "_comment": "Copy this to supabase.json (gitignored) and fill in your project's values. Supabase Dashboard -> Project Settings -> API keys. Newer projects show a 'Publishable key' (sb_publishable_...); older ones show 'anon public' (eyJ...). Either works - put whichever you have in SUPABASE_PUBLISHABLE_KEY. NEVER put the service_role / secret key here: it bypasses all row-level security.",
+
+  "SUPABASE_URL": "https://YOUR-PROJECT-REF.supabase.co",
+  "SUPABASE_PUBLISHABLE_KEY": "sb_publishable_PASTE_YOUR_KEY_HERE"
+}

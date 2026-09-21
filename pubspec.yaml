@@ -1,0 +1,70 @@
+name: roadscan
+description: >-
+  Crowd-sourced road hazard mapping for the Bidholi-Kandholi-Pondha corridor,
+  with on-device pothole and crack detection and a 3D tilted map.
+publish_to: "none"
+version: 0.1.0+1
+
+environment:
+  # maplibre_gl 0.27.x enforces a Flutter 3.29 floor.
+  sdk: ">=3.5.0 <4.0.0"
+  flutter: ">=3.29.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # --- Map -----------------------------------------------------------------
+  # maplibre_gl (0.27.1) over the newer `maplibre` rewrite (0.3.x): ~8x the
+  # downloads, a settled API, and 3D fill-extrusion is a first-class documented
+  # feature. The rewrite is the long-term future but is too young to hang a
+  # final-year demo on.
+  maplibre_gl: ^0.27.1
+
+  # --- Backend -------------------------------------------------------------
+  supabase_flutter: ^2.8.0
+
+  # --- On-device ML --------------------------------------------------------
+  # Official Ultralytics plugin. Runs LiteRT (.tflite) exports directly, so no
+  # hand-rolled tflite_flutter interpreter + NMS glue.
+  ultralytics_yolo: ^0.6.14
+
+  # --- Location & capture --------------------------------------------------
+  geolocator: ^13.0.2
+  image_picker: ^1.1.2
+  # Reads EXIF DateTimeOriginal + GPS from gallery photos.
+  # Pure Dart deliberately: native_exif pins compileSdkVersion 33, which fails
+  # the build against the androidx versions this project already pulls in.
+  # EXIF is a frozen binary format, so a pure-Dart parser loses nothing here.
+  exif: ^3.3.0
+  # Re-compresses AFTER EXIF has been read, so metadata is never lost to the
+  # resize (which is exactly what image_picker's maxWidth would have done).
+  flutter_image_compress: ^2.3.0
+  permission_handler: ^11.3.1
+
+  # --- Alerts --------------------------------------------------------------
+  flutter_local_notifications: ^18.0.1
+
+  # --- Misc ----------------------------------------------------------------
+  device_info_plus: ^11.1.1
+  shared_preferences: ^2.3.3
+  path: ^1.9.0
+  path_provider: ^2.1.5
+  http: ^1.2.2
+  intl: ^0.19.0
+  uuid: ^4.5.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/models/
+    # Real OSM map thumbnails for each launch-screen area, baked once by
+    # tool/fetch_area_maps.py so users never hit a tile server. Dark and light
+    # variants so the cards follow the app theme.
+    # (c) OpenStreetMap contributors -- credited in the launch screen caption.
+    - assets/area_maps/

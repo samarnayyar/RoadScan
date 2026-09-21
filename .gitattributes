@@ -1,0 +1,17 @@
+# Normalise line endings so the repo is consistent regardless of who clones it.
+* text=auto eol=lf
+
+# Windows-only scripts must keep CRLF or PowerShell can misparse them.
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary: never munge these.
+*.tflite binary
+*.pt     binary
+*.onnx   binary
+*.png    binary
+*.jpg    binary
+*.jpeg   binary
+*.keystore binary
+*.jks    binary

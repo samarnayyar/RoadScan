@@ -1,0 +1,20 @@
+# RoadScan -- training / export environment.
+#   python -m venv .venv && .venv\Scripts\activate
+#   pip install -r ml/requirements.txt
+#
+# Pin ultralytics at or above 8.4.83: that is the release where the standalone
+# `tflite` export format was removed in favour of `format="litert"`, which is
+# what train_export.py calls.
+ultralytics>=8.4.83
+
+# Export backend. Ultralytics pulls TF in for the LiteRT converter; it is a
+# large download (~600MB) and is only needed for `export`, not for `train`.
+tensorflow>=2.18.0
+
+# CPU wheels install by default. For CUDA training, install torch from
+# https://pytorch.org/get-started/locally/ FIRST, then this file.
+torch>=2.4.0
+torchvision>=0.19.0
+
+opencv-python>=4.10.0
+pyyaml>=6.0

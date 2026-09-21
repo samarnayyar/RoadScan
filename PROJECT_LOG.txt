@@ -1,0 +1,612 @@
+================================================================================
+ROADSCAN - COMPLETE PROJECT LOG
+Crowd-sourced road hazard mapping for the Bidholi-Pondha-Nanda Ki Chowki
+corridor around UPES Dehradun.
+
+Written 16 September 2026. Covers everything from an empty directory to the
+current state, including what works, what does not, what was got wrong along
+the way, and what remains.
+================================================================================
+
+
+--------------------------------------------------------------------------------
+0. ONE-PARAGRAPH SUMMARY
+--------------------------------------------------------------------------------
+
+RoadScan is an Android app (Flutter) where a user photographs a pothole or
+crack, a YOLO model running ON THE PHONE detects it and scores its severity,
+and the report either creates a new map pin or merges into an existing one
+within 20 metres. Other riders are warned when they approach a severe hazard.
+The map is a tilted 3D MapLibre view of the corridor. The backend is Supabase
+(Postgres + PostGIS). Everything time-critical runs on-device; the network is
+touched only to sync pins and upload photos.
+
+As of this document: the app builds, installs and runs on a real phone. The
+map, 3D tilt, area selection, capture pipeline, glass action bar and drawer all
+work. The backend is live and every one of its rules has been verified against
+real PostGIS. The pothole DETECTION MODEL HAS NOT BEEN TRAINED YET, so the app
+currently falls back to a stock COCO model and says so on screen rather than
+pretending to detect road damage.
+
+
+--------------------------------------------------------------------------------
+1. STARTING POINT
+--------------------------------------------------------------------------------
+
+Directory D:\Samar_major was completely empty.
+
+Machine:
+  - Windows 11, 7.7 GB RAM, 2 physical cores / 4 logical
+  - Intel UHD Graphics (NO CUDA - this matters for ML training)
+  - C: 12.5 GB free, D: 95.7 GB free, F: 92.8 GB free
+  - Present: Git, Python 3.13, Java 17 (Adoptium)
+  - Absent: Flutter, Dart, Android SDK, Android Studio, gh CLI
+
+Brief: a B.Tech CSE final-year major project. Hard constraints were
+"mobile only", "free resources only", "on-device ML", "3D map is the headline
+feature", and "hyperlocal to the Bidholi corridor".
+
+
+--------------------------------------------------------------------------------
+2. TECHNOLOGY CHOICES AND WHY
+--------------------------------------------------------------------------------
+
+Each of these was researched at build time rather than assumed, because the
+brief was written in September 2026 and several things had moved.
+
+MAP ENGINE: maplibre_gl 0.27.1
+  Chosen over the newer `maplibre` 0.3.x rewrite. The rewrite is the long-term
+  future and has better internals (FFI/JNI), but it sits at 0.3.x with ~13.6k
+  weekly downloads against 106k for the mature package. The 3D map is the demo
+  centrepiece; that is not where to take a dependency risk.
+  Chosen over Google Maps and Mapbox because both meter usage. MapLibre is
+  BSD-3, no API key, no user cap.
+
+MAP TILES: OpenFreeMap (https://tiles.openfreemap.org/styles/liberty)
+  No API key, no registration, and explicitly no cap on map views or tile
+  requests. Chosen over MapTiler, whose free tier is generous but metered - a
+  quota that can be exhausted is a demo that can fail.
+
+ON-DEVICE ML: ultralytics_yolo 0.6.14 (official Ultralytics Flutter plugin)
+  Runs LiteRT (.tflite) exports directly. Avoids hand-rolling a tflite_flutter
+  interpreter plus NMS glue.
+  IMPORTANT CORRECTION TO THE ORIGINAL BRIEF: Ultralytics did not merely
+  deprecate the standalone `tflite` export format - it was REMOVED in 8.4.83.
+  `format="litert"` is the only route now (it still emits a .tflite file).
+
+BACKEND: Supabase (Postgres + PostGIS)
+  Chosen over Firebase because the core dedup rule ("is there a pin within
+  20 m?") is a genuine geospatial query. PostGIS answers it with one indexed
+  ST_DWithin. Firestore has no native radius query - you would hand-roll
+  geohashing and still get approximate results.
+
+EXIF: `exif` (pure Dart), NOT native_exif
+  native_exif hardcodes compileSdkVersion 33 in its own build.gradle, which
+  fails against the androidx versions this project pulls in. Overriding it from
+  the root Gradle would work but is a fragile hack that breaks on the next AGP
+  bump. EXIF is a frozen binary format, so a pure-Dart parser gives up nothing.
+
+
+--------------------------------------------------------------------------------
+3. TOOLCHAIN INSTALLED (all on D: because C: only had 12.5 GB free)
+--------------------------------------------------------------------------------
+
+  D:\dev\flutter        Flutter SDK 3.47.4 (Dart 3.13.3)
+  D:\dev\android-sdk    cmdline-tools, platform-tools, platform 36,
+                        build-tools 36.1, NDK 28.2, CMake 3.22.1
+  D:\dev\jdk21          Temurin JDK 21.0.12.1
+  D:\dev\gh             GitHub CLI 2.101.0
+
+ANDROID STUDIO WAS NOT INSTALLED AND IS NOT NEEDED. It is a wrapper around the
+same SDK components plus an editor; the command-line SDK alone saves ~8 GB.
+Install it later only if you want the visual emulator manager or layout
+inspector - it will detect the existing SDK.
+
+Environment variables set for the current user (no admin needed) by
+tool\env_setup.ps1. Run it with -Revert to undo.
+
+Two toolchain installs failed the obvious way first, worth knowing:
+  - `winget install GitHub.cli` failed with exit 1602 ("installation
+    cancelled") because the MSI needs a UAC elevation prompt that cannot appear
+    from a background process. Solved by installing the user-scoped zip.
+  - The Android SDK first installed into a nested `devandroid-sdk/` folder
+    because bash ate the backslashes in `--sdk_root=D:\dev\android-sdk`.
+
+
+--------------------------------------------------------------------------------
+4. WHAT IS BUILT - FEATURE BY FEATURE
+--------------------------------------------------------------------------------
+
+4.1 3D MAP (lib/screens/map_home_screen.dart, lib/config/map_layers.dart)
+    - Tilted MapLibre map, pitch slider 0-60 degrees, rotation, compass reset
+    - OSM building footprints extruded via a fill-extrusion layer, reading the
+      OpenMapTiles `render_height` / `render_min_height` attributes, with a 6 m
+      fallback so untagged buildings do not extrude to zero
+    - Camera bounded to the corridor; min/max zoom 12-19
+    - Live GPS dot
+    - VERIFIED ON DEVICE: tilt 45 degrees, extruded buildings visible
+
+4.2 AREA SELECTION + ANIMATED LAUNCH (lib/screens/area_select_screen.dart)
+    - Wordmark springs in, staggered card entrance, looping radar sweep,
+      zoom-and-fade transition into the map
+    - The animation deliberately covers real startup cost (Supabase init, first
+      pin fetch, YOLO warm-up) rather than decorating a frozen splash
+    - Each card carries a procedurally generated road glyph, deterministic per
+      card, so the list does not read as four identical rectangles
+
+4.3 CAPTURE AND DETECTION (lib/screens/capture_screen.dart,
+    lib/services/detection_service.dart, lib/services/photo_metadata.dart)
+    - Two entry points: camera (live GPS + now) and gallery (EXIF time + place)
+    - On-device YOLO inference BEFORE any upload; boxes drawn over the photo
+    - GPS fix and inference run concurrently, so the user waits for the slower
+      of the two rather than their sum
+    - Severity computed locally
+    - Fail-safe: cancelling the picker or backing out of review returns to the
+      map with "No image uploaded". Cancelling a RETAKE keeps the existing photo
+
+4.4 METADATA AND PROVENANCE (lib/services/photo_metadata.dart)
+    - Reads EXIF DateTimeOriginal and GPS from gallery photos
+    - Every value is LABELLED with where it came from: "from photo", "from
+      device", "set by you". A report timestamped at upload time because the
+      photo had no EXIF is a materially different claim from one with a real
+      capture date, and hiding that would overstate the data
+    - Rejects (0,0) coordinates - several cameras write null island rather than
+      omitting the tag, which would drop a pothole in the Atlantic
+
+4.5 LOCATION ADJUSTMENT (lib/screens/adjust_location_screen.dart)
+    - The MAP MOVES UNDER A FIXED CENTRE PIN rather than dragging a marker, so
+      the user's thumb never covers the point being aimed at
+    - Opens at zoom 18.5 where one screen pixel is roughly 0.3 m
+    - Flat and north-locked: tilt makes it harder to judge which bit of road
+      the pin sits on
+
+4.6 SEVERITY SCORING (lib/services/severity.dart)
+    - severity = bounding-box area / image area, interpolated WITHIN each band
+      rather than flat per band
+    - Bands: <0.02 low (0.10-0.25), 0.02-0.08 medium (0.26-0.55),
+      0.08-0.20 high (0.56-0.80), >0.20 critical (0.81-1.00)
+    - Saturates at 50% frame area; without the cap, scores would only approach
+      1.0 for a box covering the whole image
+    - Cracks get a 0.85x multiplier
+    - THE CLASS IS DERIVED FROM THE DISCOUNTED SCORE, NOT RAW AREA. A crack at
+      8.5% frame area is "high" by area, but the discount pulls the score into
+      the medium range; classifying from area first would produce a pin labelled
+      high while carrying a medium score - badge and colour disagreeing
+    - Takes the WORST detection rather than summing areas: summing would let a
+      mesh of hairline cracks outscore one axle-breaking pothole
+
+4.7 BACKEND (supabase/schema.sql, supabase/migrations/002_captured_at.sql)
+    - hazard_reports (geography Point 4326 + GIST index), report_photos,
+      confirmations
+    - submit_report(): finds nearby, then merges or creates, in ONE transaction.
+      Doing this client-side would race - two students photographing the same
+      pothole simultaneously would both see "no match" and create two pins
+    - confirm_report(): one vote per device per direction, enforced by a unique
+      index. Three DISTINCT devices voting "no hazard" flips a pin to fixed
+    - Confidence decays as e^(-0.05 * days) and is DERIVED ON READ, never stored
+      pre-decayed. No cron job needed, and a pin read at any instant is correct
+    - RLS: read is public, but no client can insert/update/delete directly. All
+      writes go through security-definer functions
+
+4.8 PROXIMITY ALERTS (lib/services/proximity_alerts.dart,
+    lib/widgets/hazard_alert_banner.dart)
+    - System notification with a photo thumbnail, plus an in-app banner that
+      slides in from the left
+    - The two are deliberately different: the notification fires once with a
+      10-minute cooldown; the banner has NO cooldown because it must count the
+      distance down continuously and clear once the hazard is passed
+    - Distance is coarse ("In 50 m", not "In 47.3 m"). Phone GPS is 5-10 m
+      accurate, so a precise figure would claim precision the hardware cannot
+      deliver
+    - Only the NEAREST qualifying hazard alerts. One notification per pin would
+      produce four on a bad stretch and train the user to dismiss them unread
+
+4.9 UI SHELL
+    - Frosted-glass bottom bar, 46 px, real BackdropFilter over the live map,
+      split camera | gallery
+    - Drawer: All road reports / My reports / Sign in (visible but disabled and
+      labelled "Not implemented yet")
+    - Reports list with photo-count badge; each row opens the pin's full photo
+      timeline - the "see history / all versions" view
+
+
+--------------------------------------------------------------------------------
+5. VERIFICATION - WHAT WAS ACTUALLY PROVEN, NOT ASSUMED
+--------------------------------------------------------------------------------
+
+5.1 UNIT TESTS: 18 tests / 48 assertions, all passing (`flutter test`)
+    Covers band boundaries, monotonicity, saturation, the crack discount and
+    its interaction with classification, worst-detection selection, the decay
+    curve at documented checkpoints, and label matching.
+    Before running them, every expected value was independently re-derived in a
+    separate Python implementation and checked - so the tests are not merely
+    agreeing with the code they test.
+
+5.2 STATIC ANALYSIS: `flutter analyze` - no issues.
+
+5.3 SCHEMA CONSISTENCY: tool/check_schema.py - passes.
+    Catches app/database drift without a live Postgres: renamed RPCs, a
+    constant tuned on one side only, a result key the Dart reads that the SQL
+    never produces, a missing grant, or an OUT parameter that would shadow a
+    table or column inside PL/pgSQL.
+
+5.4 BACKEND VERIFIED AGAINST THE LIVE DATABASE (not reasoned about - executed):
+      - New pin created                                      PASS
+      - Report 11 m away, different device -> MERGES         PASS (count -> 2)
+      - Report 55 m away -> separate pin                     PASS (55.4 m)
+      - Crack at a pothole's exact coords -> separate pin    PASS
+      - Weaker report merging in -> worst severity wins      PASS (stayed 0.90)
+      - 3 distinct devices vote fixed -> flips on the 3rd    PASS
+      - Same device voting twice -> no double-count          PASS
+    Test rows were then removed via supabase/cleanup_selftest.sql.
+
+5.5 ON DEVICE (OnePlus/OPPO CPH2573, Android 16, API 36, arm64):
+      - App installs, launches, no crash, no Flutter errors
+      - Area selection screen renders
+      - Map renders the real UPES campus (D2, D3, Infirmary, food corners)
+      - 3D tilt confirmed at 45 degrees with extruded buildings visible
+      - Glass bar, drawer button, pitch slider all render
+
+
+--------------------------------------------------------------------------------
+6. BUGS FOUND AND FIXED (including ones introduced during this work)
+--------------------------------------------------------------------------------
+
+6.1 SQL: `order by 14` sorted pins by PHOTO PATH instead of distance.
+    The alert system would have warned about the wrong pothole. Rewritten as an
+    explicit expression so adding a column cannot silently break it again.
+
+6.2 SQL: confirmation_count meant "photos" in submit_report but "distinct
+    devices" in confirm_report. The badge would jump depending on which path
+    last touched the row. Unified to distinct devices.
+
+6.3 SQL: inside an UPDATE, every column reference in SET reads the OLD row. So
+    derived_status(status, last_confirmed_at) on a positive vote tested the
+    PREVIOUS timestamp - a pin that had gone stale would be recomputed as stale
+    again, immediately undoing the confirmation that just arrived.
+
+6.4 SQL: OUT parameters named `status` and `confirmations` would shadow the
+    hazard_reports column and the confirmations TABLE inside PL/pgSQL. All OUT
+    params are now `out_` prefixed.
+
+6.5 DART: detection result parsing was written against the pub.dev docs, which
+    say predict() returns List<YOLOResult>. Reading the plugin SOURCE showed it
+    actually returns a Map with a 'detections' key, and that
+    YOLOResult.normalizedBox is already a 0-1 Rect. The original defensive
+    coordinate-guessing code was replaced with the real contract.
+
+6.6 GRADLE: Flutter 3.47.4's OWN TEMPLATE is broken - app/build.gradle.kts
+    emits a `kotlin { compilerOptions { ... } }` block but never applies
+    kotlin-android in plugins{}. This reproduces for anyone running
+    `flutter create` on this version. Fixed by applying the plugin.
+
+6.7 GRADLE: gradle.properties shipped `-Xmx8G -XX:MaxMetaspaceSize=4G` on a
+    7.7 GB machine. The JVM started and then died partway through Kotlin
+    compilation, surfacing as "Could not close incremental caches ...
+    class-fq-name-to-source.tab" across every plugin module - which reads like
+    disk corruption but is actually out-of-memory. THIS WOULD HAVE BROKEN EVERY
+    BUILD ON THIS LAPTOP, not just one. Now 1536m with a separate 1024m Kotlin
+    daemon heap, workers capped at 2, incremental compilation off.
+
+6.8 GRADLE: maplibre_gl 0.27.x compiles against Java 21; JDK 17 gave
+    "error: invalid source release: 21". Installed Temurin 21.
+
+6.9 GRADLE: flutter_local_notifications needs core library desugaring or the
+    build fails at :app:checkDebugAarMetadata. Enabled with desugar_jdk_libs
+    2.1.4.
+
+6.10 MY OWN BUG: tool/setup_android.ps1 used `Set-Content -Encoding UTF8`,
+     which in PowerShell 5.1 writes a UTF-8 BOM. Gradle's Kotlin DSL parser
+     rejects a BOM on line 1. Added a Write-Utf8NoBom helper so it cannot recur.
+
+6.11 3D TILT NEVER APPLIED - the headline feature was silently broken.
+     MapLibre Android does not reliably honour `tilt` from
+     initialCameraPosition, so it reported 0 during startup. The onCameraIdle
+     handler then synced that 0 back into _pitch, permanently flattening the map
+     and pinning the slider at zero; every later camera move inherited tilt 0.
+     Fixed by applying tilt explicitly after style load and guarding the idle
+     handler until the camera has been deliberately positioned.
+
+6.12 AREA COORDINATES WERE WRONG, AND THE BOUNDS MADE IT WORSE.
+     Geocoded all four against OpenStreetMap: Pondha was ~3 km out, Nanda Ki
+     Chowki ~1.5 km. More seriously, campusBounds started at lat 30.395 while
+     Pondha (30.372), Nanda Ki Chowki (30.343) and Bidholi village (30.390) all
+     sit SOUTH of it - the camera was hard-locked out of three of the four
+     areas. That is why they could not be found on the map.
+
+6.13 image_picker's maxWidth/imageQuality RE-ENCODE the file and DISCARD EXIF.
+     The original capture path would have destroyed exactly the metadata the
+     gallery-upload feature depends on. Now: pick the original untouched, read
+     EXIF, then compress a copy.
+
+
+--------------------------------------------------------------------------------
+7. CURRENT STATUS
+--------------------------------------------------------------------------------
+
+WORKING AND VERIFIED
+  [x] Flutter 3.47.4 toolchain, Android SDK 36, JDK 21
+  [x] APK builds (242 MB debug) and installs on the test phone
+  [x] 3D tilted map with building extrusion - confirmed on device
+  [x] Area selection: UPES Bidholi, Bidholi, Pondha, Nanda Ki Chowki
+  [x] Animated launch screen
+  [x] Camera + gallery capture with EXIF metadata and provenance labelling
+  [x] Drag-to-place location adjustment
+  [x] Severity scoring (18 tests)
+  [x] Supabase backend live; all dedup/decay/confirmation rules verified
+  [x] Proximity alerts (system notification + in-app banner) - CODE COMPLETE,
+      never seen firing because the database has no pins yet
+  [x] Drawer, reports list, photo timeline
+  [x] Glass action bar, capture fail-safes
+  [x] flutter analyze clean, 18/18 tests passing
+
+NOT DONE
+  [ ] THE POTHOLE MODEL IS NOT TRAINED. The app falls back to a stock COCO
+      model and says so on screen. Capture runs end to end but detects nothing.
+  [ ] Migration 002 NOT YET APPLIED to the live database. Until it is,
+      submitting a report fails and both reports lists error.
+  [ ] Accident-risk model + SHAP microservice. The pin sheet shows a clearly
+      labelled heuristic placeholder instead.
+  [ ] Login / accounts (deliberately - visible but disabled in the drawer)
+  [ ] Dense 3D buildings (see 8.1)
+  [ ] Kandoli as a selectable area (see 8.2)
+
+KNOWN LIMITATIONS TO STATE IN THE REPORT
+  - Severity is a geometric proxy. No public dataset labels road damage by
+    severity, and none exists for these roads at all, so there is nothing to
+    regress against. Weakness: scale - the same pothole from 1 m and 5 m gives
+    different areas. Mitigations worth naming (not implemented): a reference
+    object, accelerometer-derived camera height, or ARCore depth.
+  - Alerts are FOREGROUND-ONLY. Android restricts background location hard, and
+    this was observed directly during testing: OPPO's power manager
+    (OplusHansManager) froze and then killed the app within seconds of the
+    screen sleeping. Do not overclaim background reliability.
+  - Anti-abuse is minimal. With no accounts, a client could forge device IDs.
+    Server functions enforce one vote per device per pin, but that is only as
+    good as the ID.
+  - Free tiers are demo-scale. Supabase free: 500 MB DB, 1 GB storage,
+    50,000 MAU. A free project PAUSES after 7 days of inactivity - wake it the
+    day before any demo or viva.
+  - Android 10+ redacts GPS from gallery photos unless
+    MediaStore.setRequireOriginal() is called, which image_picker does not do.
+    Capture DATES come through; LOCATION often will not. This is why the
+    drag-to-place screen exists.
+  - The "glitchiness" reported during testing has NOT been properly measured.
+    An initial reading of "80% janky frames" from dumpsys gfxinfo was
+    misleading: it was based on 5 frames, and gfxinfo cannot see MapLibre at
+    all because it renders to its own surface. A structural fix was made (the
+    map is no longer rebuilt on every setState), but proving it needs a
+    --profile build with DevTools.
+
+
+--------------------------------------------------------------------------------
+8. OPEN QUESTIONS AND DECISIONS NEEDED FROM YOU
+--------------------------------------------------------------------------------
+
+8.1 3D BUILDINGS - THE BIGGEST REMAINING VISUAL GAP
+    Your campus renders only ~3 extruded buildings because OPENSTREETMAP HAS
+    ALMOST NO BUILDING FOOTPRINTS IN BIDHOLI. This is a DATA problem, not a
+    rendering one - the extrusion code works, it just has almost no polygons.
+
+    OPTION A (recommended, free): import the VIDA combined
+    Google + Microsoft + OSM Open Buildings dataset. AI-derived footprints
+    covering India under CC BY-4.0 / ODbL, covering exactly the semi-rural
+    areas OSM misses. Import the corridor's footprints into PostGIS, serve as
+    GeoJSON, extrude with the layer that already exists. No API key, no quota,
+    no architecture change. Result: flat-roofed extrusions, not textured
+    meshes - but CONSISTENT, which is the actual complaint.
+
+    OPTION B: Google Photorealistic 3D Tiles. Three problems:
+      1. NOT FREE. 1,000 requests/month then USD 0.60 per 1,000, billed as an
+         Enterprise SKU that the USD 200 monthly credit does not cover. One 3D
+         session loads dozens to hundreds of tiles.
+      2. CANNOT RENDER IN THIS STACK. It is OGC 3D Tiles, served to CesiumJS,
+         Unreal, Unity and NVIDIA Omniverse. MapLibre cannot render it and
+         there is no Flutter renderer. The realistic path is a WebView running
+         the Maps JavaScript API's <gmp-map-3d> element.
+      3. COVERAGE IS THE LIKELY KILLER. ~2,500 cities, overwhelmingly major
+         metros. Bidholi is semi-rural outskirts of Dehradun.
+
+    ACTION: open tool/google3d_coverage_test.html in Chrome, paste a Google
+    Maps API key, and click through. It shows all four of your locations at a
+    70-degree tilt plus New Delhi and Times Square as CONTROLS. If Times Square
+    renders textured 3D and Bidholi renders flat ground, Option B is dead and
+    Option A is the answer. This takes about 30 seconds and settles it.
+
+8.2 WHERE IS KANDOLI?
+    OpenStreetMap has no "Kandoli" or "Kandholi" anywhere in this corridor. The
+    only match is Kandoli Park, ~10 km east in Dehradun city, which is clearly
+    a different place. Rather than invent a coordinate, the slot was given to
+    UPES Bidholi and Bidholi village as separate entries. You are local - a
+    rough description ("about 1 km west of Energy Acres") is enough to add it
+    back with a real position.
+
+8.3 "GOD'S EYE"
+    Mentioned as a reference for how to build the 3D layout. The reference is
+    not clear - a link or fuller name is needed before it can be looked at.
+
+8.4 WHAT EXACTLY IS GLITCHY?
+    Needed to fix it properly: stutter while panning, flicker, slow tap
+    response, or a freeze on a particular screen? The cause and the fix differ
+    for each.
+
+
+--------------------------------------------------------------------------------
+9. IMMEDIATE NEXT STEPS, IN ORDER
+--------------------------------------------------------------------------------
+
+STEP 1 - RUN MIGRATION 002 (5 minutes, blocks everything else)
+  Supabase Dashboard -> SQL Editor -> New query -> paste ALL of
+  supabase/migrations/002_captured_at.sql -> Run.
+  Verified as NOT YET APPLIED: all_reports, device_reports and the
+  p_captured_at form of submit_report all return 404.
+  If they still 404 afterwards: Settings -> API -> Reload schema cache.
+
+STEP 2 - TRAIN THE MODEL (the single biggest quality lever)
+  THIS LAPTOP CANNOT DO IT. Intel UHD graphics, no CUDA; 100 epochs on CPU
+  would take days. Use Google Colab's free T4 GPU.
+    - colab.research.google.com -> New notebook
+    - Runtime -> Change runtime type -> T4 GPU
+    - Verify with !nvidia-smi
+    - !pip install ultralytics, mount Drive, train as in ml/train_export.py
+    - model.export(format='litert', imgsz=640, int8=True, data=...)
+    - Download the .tflite, rename to roadscan.tflite, put in assets/models/
+    - python ml/train_export.py verify
+
+  DATASET: RDD2022 is the best public base and includes an India split.
+  `python ml/train_export.py prepare --rdd2022 <path>` collapses its four
+  damage classes onto our two (D00/D10/D20 -> crack, D40 -> pothole).
+
+  YOU STILL NEED LOCAL PHOTOS. RDD2022 has no hill-terrain Uttarakhand data.
+  Photograph and label 100-300 real potholes along the corridor:
+    - phone held ~1-1.5 m up, angled down, the way a user would
+    - vary conditions deliberately: morning / midday / evening, dry and wet,
+      shaded and full sun. Hill roads are heavily shadowed and that is where a
+      naively trained model falls apart
+    - INCLUDE NEGATIVES (intact road). Without them the model learns
+      "tarmac => pothole" and fires constantly
+    - label with Roboflow (easiest) using exactly the class names
+      `pothole` and `crack`
+
+STEP 3 - SEE THE ALERT BANNER WORK
+  It has never been observed firing because the database is empty. Either walk
+  outside and report a hazard, or seed 3-4 pins 50-200 m around your position
+  and walk toward them to watch the distance count down.
+
+STEP 4 - DECIDE THE BUILDINGS QUESTION (8.1), then implement Option A.
+
+STEP 5 - RISK MODEL + SHAP MICROSERVICE
+  Small FastAPI service, scikit-learn Random Forest + SHAP TreeExplainer, on a
+  free host. Will need synthetic or heuristic labels - no local accident
+  dataset exists. State that as a documented limitation, as with severity.
+
+
+--------------------------------------------------------------------------------
+10. FUTURE SCOPE (beyond the project deadline)
+--------------------------------------------------------------------------------
+
+  - Background alerting that survives OEM battery killers (Xiaomi/Oppo/Vivo).
+    This is genuinely its own project; a foreground service plus per-vendor
+    autostart whitelisting, and still unreliable.
+  - Depth-aware severity via ARCore, removing the camera-distance weakness of
+    the area proxy.
+  - Road-condition classifier as a second model input to the risk score.
+  - Authenticated accounts, enabling report reputation and real anti-abuse
+    (anonymous auth or Play Integrity attestation).
+  - Municipal export: a report of critical pins for the PWD / cantonment board,
+    which is the obvious real-world use of the collected data.
+  - Route-aware alerting: warn only about hazards ON the user's heading, rather
+    than any hazard within a radius.
+  - Offline tile caching for areas with poor connectivity.
+  - iOS build. Nothing in the architecture prevents it; MapLibre, Supabase and
+    the Ultralytics plugin all support iOS.
+  - Multi-city expansion, which would need the free-tier assumptions revisited.
+  - PIN CLUSTERING at low zoom. Not needed at campus scale but the map will
+    slow noticeably past a few thousand pins.
+
+
+--------------------------------------------------------------------------------
+11. PROJECT LAYOUT
+--------------------------------------------------------------------------------
+
+  lib/config/       app_config.dart      every tunable number, with rationale
+                    map_layers.dart      3D extrusion + pin layer styling
+  lib/models/       detection.dart       hazard/severity classes, normalised boxes
+                    hazard_report.dart   a pin as returned by the backend
+  lib/services/     severity.dart        scoring + decay (pure, fully tested)
+                    detection_service.dart   on-device YOLO
+                    photo_metadata.dart  EXIF, compression, provenance
+                    supabase_service.dart    all backend access
+                    proximity_alerts.dart    notifications
+                    location_service.dart, device_identity.dart
+  lib/screens/      area_select_screen.dart  animated launch + area picker
+                    map_home_screen.dart     the 3D map
+                    capture_screen.dart      capture -> detect -> submit
+                    adjust_location_screen.dart  drag-to-place
+                    reports_screen.dart      incident list + history
+  lib/widgets/      hazard_alert_banner.dart glass_action_bar.dart
+                    pin_detail_sheet.dart    detection_overlay.dart
+                    app_drawer.dart          pitch_control.dart
+                    stats_overlay.dart
+  supabase/         schema.sql               tables, PostGIS, RPCs, RLS
+                    migrations/002_captured_at.sql   backdated reports + lists
+                    cleanup_selftest.sql     removes verification rows
+  ml/               train_export.py          dataset prep, training, LiteRT export
+                    requirements.txt
+  tool/             setup_android.ps1        platform scaffold + patches
+                    env_setup.ps1            PATH / JAVA_HOME / ANDROID_HOME
+                    check_schema.py          app/database consistency check
+                    google3d_coverage_test.html   settles the Google 3D question
+  test/             severity_test.dart       18 tests / 48 assertions
+  docs/             SETUP_STEPS.md           setup split by who does what
+
+  Approximate sizes: lib 5,100 lines, supabase 660, tool 540, ml 310,
+  test 220, docs 270.
+
+
+--------------------------------------------------------------------------------
+12. COMMIT HISTORY
+--------------------------------------------------------------------------------
+
+  3d6fc6d  Initial commit: RoadScan Android app (map + capture + backend)
+  90880e9  Fix Android build; verify backend against live Supabase
+  a964ff2  Fix Android build: memory limits, JDK 21, core library desugaring
+  fa1a9a7  Add animated launch screen, area selection, live proximity banner
+  fc0a437  Add gallery upload with EXIF metadata, location adjustment, glass
+           bar, drawer
+  bf277fc  Swap native_exif for pure-Dart exif to unblock the Android build
+  9524c86  Updates  (committed by you)
+  b5fbdbb  Fix 3D tilt, correct all area coordinates, slim UI, add capture
+           fail-safes
+
+  Remote: https://github.com/aryanraj71/roadscan.git
+
+
+--------------------------------------------------------------------------------
+13. HOW TO RUN IT
+--------------------------------------------------------------------------------
+
+  Setup once:
+    powershell -ExecutionPolicy Bypass -File tool\env_setup.ps1
+    (open a NEW terminal afterwards)
+
+  Credentials:
+    copy supabase.example.json supabase.json     # then paste your values
+
+  Run on a connected phone:
+    flutter run --dart-define-from-file=supabase.json
+    (or press F5 in VS Code - .vscode/launch.json is already wired)
+
+  Checks:
+    flutter test                      # 18 logic tests, no device needed
+    flutter analyze
+    python tool/check_schema.py       # app/database consistency
+    python ml/train_export.py verify  # model class-name contract
+
+  Wireless debugging (the phone drops the connection whenever the screen sleeps
+  for a while; the PORT CHANGES each time it restarts):
+    adb pair <ip>:<pairing-port> <6-digit-code>    # once
+    adb connect <ip>:<connect-port>                # each session
+    adb mdns services                              # finds the current port
+
+
+--------------------------------------------------------------------------------
+14. SECURITY NOTE
+--------------------------------------------------------------------------------
+
+This repository COMMITS supabase.json, containing the Supabase URL and the
+publishable/anon key. That is a deliberate choice for a private student repo.
+
+BEFORE MAKING THIS REPO PUBLIC, OR ADDING A COLLABORATOR YOU DO NOT FULLY
+TRUST, ROTATE THE SUPABASE KEY (Dashboard -> Project Settings -> API keys ->
+Roll). Deleting the file later does NOT help - git keeps the old value in
+history forever.
+
+The committed key must only ever be the publishable/anon key, which is
+constrained by the RLS policies in supabase/schema.sql. NEVER commit the
+service_role / secret key: it bypasses RLS entirely and would let anyone
+holding it read, alter or wipe the whole database.
+
+================================================================================
+END OF LOG
+================================================================================

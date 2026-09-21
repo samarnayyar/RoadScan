@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Google 3D coverage check - Bidholi</title>
+<style>
+  body { margin:0; font-family:system-ui,sans-serif; background:#0e1a26; color:#e8eef4; }
+  header { padding:14px 18px; background:#16293a; border-bottom:1px solid #22394d; }
+  h1 { margin:0 0 4px; font-size:16px; }
+  p  { margin:0; font-size:12.5px; color:#8fa3b5; }
+  #key { width:min(520px,80vw); padding:7px 9px; margin:10px 0 0; border-radius:7px;
+         border:1px solid #33506a; background:#0e1a26; color:#e8eef4; font-family:monospace; }
+  button { padding:7px 14px; margin-left:6px; border-radius:7px; border:0;
+           background:#2e9cd6; color:#fff; font-weight:600; cursor:pointer; }
+  nav { padding:8px 18px; background:#12222f; display:flex; gap:8px; flex-wrap:wrap; }
+  nav button { background:#22394d; }
+  #map { width:100%; height:calc(100vh - 165px); }
+  #verdict { padding:10px 18px; font-size:13px; background:#16293a; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Does Google have photorealistic 3D for your area?</h1>
+  <p>Paste a Google Maps API key with the <b>Maps JavaScript API</b> enabled and billing on.
+     The key stays in this page; nothing is uploaded anywhere.</p>
+  <input id="key" placeholder="AIza..." />
+  <button onclick="load()">Load 3D map</button>
+</header>
+
+<nav>
+  <button onclick="go(30.41761,77.96827,'UPES Bidholi')">UPES Bidholi</button>
+  <button onclick="go(30.39043,77.96750,'Bidholi')">Bidholi</button>
+  <button onclick="go(30.37248,77.97567,'Pondha')">Pondha</button>
+  <button onclick="go(30.34330,77.94098,'Nanda Ki Chowki')">Nanda Ki Chowki</button>
+  <button onclick="go(30.3165,78.0322,'Dehradun centre')">Dehradun centre</button>
+  <button onclick="go(28.6139,77.2090,'New Delhi')">New Delhi (control)</button>
+  <button onclick="go(40.7580,-73.9855,'Times Square')">Times Square (control)</button>
+</nav>
+
+<div id="map"></div>
+
+<div id="verdict">
+  Load a location, then judge what you see.
+  <b>Textured buildings and terrain</b> = covered.
+  <b>Flat grey/green ground with no 3D structures</b> = NOT covered there.
+  Compare each Bidholi location against the two controls: Times Square is
+  definitely covered, so if it looks 3D and Bidholi does not, that is your answer.
+</div>
+
+<script>
+let map3d = null;
+
+function load() {
+  const key = document.getElementById('key').value.trim();
+  if (!key) { alert('Paste your API key first.'); return; }
+
+  // v=alpha is required: the 3D map element is not in the stable channel yet.
+  const s = document.createElement('script');
+  s.src = `https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(key)}&v=alpha&libraries=maps3d`;
+  s.onerror = () => {
+    document.getElementById('verdict').innerHTML =
+      '<b style="color:#ff8a80">Could not load the Maps script.</b> ' +
+      'Usually a bad key, the Maps JavaScript API not enabled, or billing not set up.';
+  };
+  s.onload = init;
+  document.head.appendChild(s);
+}
+
+async function init() {
+  try {
+    await google.maps.importLibrary('maps3d');
+    go(30.41761, 77.96827, 'UPES Bidholi');
+  } catch (e) {
+    document.getElementById('verdict').innerHTML =
+      '<b style="color:#ff8a80">maps3d library failed to load:</b> ' + e.message;
+  }
+}
+
+function go(lat, lng, label) {
+  const host = document.getElementById('map');
+  if (!window.google || !google.maps.maps3d) { alert('Load the map first.'); return; }
+
+  host.innerHTML = '';
+  map3d = document.createElement('gmp-map-3d');
+  map3d.setAttribute('mode', 'satellite');
+  // Low, tilted view -- the angle that makes missing 3D obvious at a glance.
+  map3d.setAttribute('center', `${lat},${lng},220`);
+  map3d.setAttribute('tilt', '70');
+  map3d.setAttribute('range', '900');
+  map3d.style.width = '100%';
+  map3d.style.height = '100%';
+  host.appendChild(map3d);
+
+  document.getElementById('verdict').innerHTML =
+    `Showing <b>${label}</b> (${lat}, ${lng}). ` +
+    'Textured 3D buildings = covered. Flat ground = not covered.';
+}
+</script>
+</body>
+</html>

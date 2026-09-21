@@ -1,0 +1,54 @@
+import 'package:flutter/material.dart';
+
+import 'config/app_theme.dart';
+import 'screens/area_select_screen.dart';
+import 'services/proximity_alerts.dart';
+import 'services/supabase_service.dart';
+import 'services/theme_controller.dart';
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+
+  // Before runApp so the first frame is already in the right theme -- loading
+  // it afterwards would flash the wrong palette on every cold start.
+  await ThemeController.instance.load();
+
+  // Neither of these is allowed to prevent the app from starting. A missing
+  // Supabase key or a denied notification permission should degrade the app to
+  // "3D map with no pins", not to a blank screen -- which matters when the
+  // demo device is on unfamiliar campus wifi.
+  try {
+    await SupabaseService.initialise();
+  } catch (e) {
+    debugPrint('RoadScan: Supabase init failed: $e');
+  }
+
+  try {
+    await ProximityAlerts.instance.initialise();
+  } catch (e) {
+    debugPrint('RoadScan: notifications unavailable: $e');
+  }
+
+  runApp(const RoadScanApp());
+}
+
+class RoadScanApp extends StatelessWidget {
+  const RoadScanApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return ValueListenableBuilder<ThemeMode>(
+      valueListenable: ThemeController.instance.mode,
+      builder: (context, mode, _) {
+        return MaterialApp(
+          title: 'RoadScan',
+          debugShowCheckedModeBanner: false,
+          theme: AppTheme.light,
+          darkTheme: AppTheme.dark,
+          themeMode: mode,
+          home: const AreaSelectScreen(),
+        );
+      },
+    );
+  }
+}
