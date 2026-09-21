@@ -82,6 +82,23 @@ class LocationService {
     }
   }
 
+  /// Fires whenever the user turns location services on or off in system
+  /// settings.
+  ///
+  /// Without this, a map opened while GPS was off stayed permanently blind:
+  /// the one-shot fix at startup failed, and nothing ever asked again, so
+  /// enabling location did nothing until the screen was rebuilt.
+  Stream<ServiceStatus> serviceStatus() => Geolocator.getServiceStatusStream();
+
+  /// Whether a fix is obtainable right now -- services on AND permission
+  /// granted. Cheap enough to poll on app resume; does NOT prompt.
+  Future<bool> isAvailable() async {
+    if (!await Geolocator.isLocationServiceEnabled()) return false;
+    final perm = await Geolocator.checkPermission();
+    return perm == LocationPermission.always ||
+        perm == LocationPermission.whileInUse;
+  }
+
   /// Continuous updates for the map dot and proximity alerts.
   ///
   /// The 5m distance filter keeps us from waking the alert check on GPS jitter

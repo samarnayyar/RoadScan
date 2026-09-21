@@ -40,7 +40,9 @@ class StatsOverlay extends StatelessWidget {
       decoration: BoxDecoration(
         color: c.surface.withValues(alpha: 0.94),
         borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: c.border.withValues(alpha: 0.6)),
+        // Floats on the map, so it takes the map-contrasting outline too --
+        // see RoadScanColors.chromeBorder.
+        border: Border.all(color: c.chromeBorder, width: 1.0),
         boxShadow: const [
           BoxShadow(color: Color(0x1A000000), blurRadius: 10, offset: Offset(0, 2)),
         ],

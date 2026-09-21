@@ -1,7 +1,9 @@
+import 'dart:convert';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show rootBundle;
 import 'package:maplibre_gl/maplibre_gl.dart';
 
 import '../models/detection.dart';
@@ -17,7 +19,13 @@ class MapLayers {
   MapLayers._();
 
   static const String buildingsLayerId = 'roadscan-3d-buildings';
+  static const String mlBuildingsSourceId = 'roadscan-ml-buildings';
+  static const String mlBuildingsLayerId = 'roadscan-ml-buildings-extrusion';
   static const String roadsLayerId = 'roadscan-road-contrast';
+  static const String userSourceId = 'roadscan-user';
+  static const String userPulseLayerId = 'roadscan-user-pulse';
+  static const String userAccuracyLayerId = 'roadscan-user-accuracy';
+  static const String userDotLayerId = 'roadscan-user-dot';
   static const String areaLabelSourceId = 'roadscan-area-labels';
   static const String areaLabelHaloLayerId = 'roadscan-area-labels-halo';
   static const String areaLabelLayerId = 'roadscan-area-labels-text';
@@ -126,6 +134,209 @@ class MapLayers {
       // Below z14 the footprints are too small to read and extruding thousands
       // of them is wasted GPU time.
       minzoom: 14.0,
+      enableInteraction: false,
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Building footprints
+  // ---------------------------------------------------------------------------
+
+  /// Extrudes the bundled Microsoft ML footprints.
+  ///
+  /// This is what makes the corridor look inhabited. OSM has 151 buildings
+  /// inside the operating square -- measured, see tool/fetch_buildings.py --
+  /// of which 8 are triangles and none carry a height, so the previous 3D
+  /// view was a handful of identical 6 m wedges scattered over 81 km2. The
+  /// bundled dataset has 15,121.
+  ///
+  /// Heights are ESTIMATED from footprint area by the bake script. They are a
+  /// presentation heuristic, not survey data, and the report should say so.
+  ///
+  /// Replaces the OSM extrusion rather than sitting alongside it: the two
+  /// datasets cover the same buildings, so drawing both would z-fight and
+  /// double-render every wall in the few places OSM does have data.
+  static Future<void> addMlBuildings(
+    MapLibreMapController c, {
+    required bool dark,
+  }) async {
+    // Hide the BASEMAP's own building layers first.
+    //
+    // These are the source of the stray triangular blocks: they are the
+    // style's own rendering of the same sparse, badly-drawn OSM footprints,
+    // and they sat underneath our layer rather than being replaced by it, so
+    // the two datasets collided wherever OSM happened to have data.
+    //
+    // Layer ids verified against the live styles rather than assumed --
+    // `liberty` ships a `building` fill AND a `building-3d` extrusion, while
+    // `dark` ships only `building`. Hiding an id a style does not have throws,
+    // hence the per-layer try.
+    for (final id in const ['building', 'building-3d']) {
+      try {
+        await c.setLayerVisibility(id, false);
+      } catch (_) {
+        // Not present in this style; nothing to hide.
+      }
+    }
+
+    final raw = await rootBundle.loadString('assets/buildings.geojson');
+    await c.addGeoJsonSource(
+      mlBuildingsSourceId,
+      json.decode(raw) as Map<String, dynamic>,
+    );
+
+    await c.addFillExtrusionLayer(
+      mlBuildingsSourceId,
+      mlBuildingsLayerId,
+      FillExtrusionLayerProperties(
+        // Two independent sources of variation, because height alone was not
+        // enough to stop 15,000 blocks reading as one grey mass:
+        //
+        //   `h` gives the broad tiering -- sheds darker, tall blocks lighter,
+        //       so the skyline has a legible hierarchy.
+        //   `t` is a per-building tint baked into the asset (a hash of the
+        //       footprint's own coordinates, so it is stable across launches
+        //       and devices -- a building that changes shade between runs
+        //       reads as a rendering glitch).
+        //
+        // Warm-grey rather than neutral: pure grey against a blue-tinted
+        // basemap looks like untextured geometry, which is exactly the
+        // complaint.
+        fillExtrusionColor: [
+          'interpolate',
+          ['linear'],
+          ['+', ['*', ['get', 'h'], 0.045], ['*', ['get', 't'], 0.55]],
+          0.15, dark ? '#25384C' : '#CFD4DA',
+          0.55, dark ? '#334C66' : '#C3C9D1',
+          1.10, dark ? '#46617E' : '#B4BCC7',
+        ],
+        fillExtrusionHeight: ['get', 'h'],
+        fillExtrusionBase: 0,
+        fillExtrusionOpacity: 0.95,
+        // The single biggest win for "they look like flat blocks": shades the
+        // walls darker than the roof, so each building reads as a solid with
+        // faces rather than a coloured silhouette.
+        fillExtrusionVerticalGradient: true,
+      ),
+      // 15k polygons is a lot to extrude at corridor zoom, where each would be
+      // a couple of pixels anyway. Below z15 they are not worth the GPU time.
+      minzoom: 15.0,
+      enableInteraction: false,
+    );
+
+    // Directional light. MapLibre's default is [1.15, 210, 30] anchored to the
+    // VIEWPORT, which means the lighting swings around as you rotate the map
+    // and every face ends up similarly lit -- part of why the blocks looked
+    // flat. Anchoring to the MAP and dropping the polar angle to 55 puts the
+    // sun low and fixed to the north-west, so walls facing away fall into
+    // genuine shade and rotating the map moves the shadows convincingly.
+    await c.setLight(LightProperties(
+      anchor: 'map',
+      position: const [1.4, 200, 55],
+      color: dark ? '#9FC4E8' : '#FFF6E8',
+      intensity: dark ? 0.32 : 0.45,
+    ));
+  }
+
+  // ---------------------------------------------------------------------------
+  // User position
+  // ---------------------------------------------------------------------------
+
+  static Map<String, dynamic> userGeoJson(double? lat, double? lon) => {
+        'type': 'FeatureCollection',
+        'features': [
+          if (lat != null && lon != null)
+            {
+              'type': 'Feature',
+              'geometry': {
+                'type': 'Point',
+                'coordinates': [lon, lat],
+              },
+              'properties': const {},
+            },
+        ],
+      };
+
+  /// Draws the user's own position.
+  ///
+  /// This replaces MapLibre's built-in location component, which had two
+  /// problems here: its dot is a fixed small size that becomes almost
+  /// invisible once you zoom out to see the whole corridor, and it is tied to
+  /// the plugin's own tracking mode -- which had to be turned off, because
+  /// with the camera clamped to the operating square it pinned the view to the
+  /// boundary whenever the user stood outside it.
+  ///
+  /// Three stacked circles, drawn in this order:
+  ///   pulse    a soft halo that GROWS as you zoom out, so the marker stays
+  ///            findable at corridor scale instead of shrinking to a speck
+  ///   accuracy a ring suggesting GPS uncertainty
+  ///   dot      the position itself, white-ringed so it reads over any basemap
+  static Future<void> addUserLayers(
+    MapLibreMapController c, {
+    required bool dark,
+  }) async {
+    await c.addGeoJsonSource(userSourceId, userGeoJson(null, null));
+
+    await c.addCircleLayer(
+      userSourceId,
+      userPulseLayerId,
+      const CircleLayerProperties(
+        // Inverted with zoom on purpose: big when zoomed out (where you need
+        // to find yourself), tight when zoomed in (where the dot is enough).
+        circleRadius: [
+          'interpolate',
+          ['linear'],
+          ['zoom'],
+          12, 26.0,
+          14, 20.0,
+          16, 14.0,
+          19, 10.0,
+        ],
+        circleColor: '#2E9CD6',
+        circleOpacity: 0.20,
+        circleBlur: 0.65,
+      ),
+      enableInteraction: false,
+    );
+
+    await c.addCircleLayer(
+      userSourceId,
+      userAccuracyLayerId,
+      const CircleLayerProperties(
+        circleRadius: [
+          'interpolate',
+          ['linear'],
+          ['zoom'],
+          12, 13.0,
+          16, 9.0,
+          19, 7.0,
+        ],
+        circleColor: '#2E9CD6',
+        circleOpacity: 0.16,
+        circleStrokeColor: '#4FB8ED',
+        circleStrokeWidth: 1.0,
+        circleStrokeOpacity: 0.45,
+      ),
+      enableInteraction: false,
+    );
+
+    await c.addCircleLayer(
+      userSourceId,
+      userDotLayerId,
+      CircleLayerProperties(
+        circleRadius: [
+          'interpolate',
+          ['linear'],
+          ['zoom'],
+          12, 7.0,
+          16, 6.5,
+          19, 6.0,
+        ],
+        circleColor: '#1E88E5',
+        circleStrokeColor: dark ? '#FFFFFF' : '#FFFFFF',
+        circleStrokeWidth: 2.5,
+        circleStrokeOpacity: 1.0,
+      ),
       enableInteraction: false,
     );
   }

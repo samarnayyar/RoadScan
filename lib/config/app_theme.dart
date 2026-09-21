@@ -27,6 +27,7 @@ class RoadScanColors extends ThemeExtension<RoadScanColors> {
     required this.accent,
     required this.accentSoft,
     required this.scrim,
+    required this.chromeBorder,
     required this.isDark,
   });
 
@@ -56,6 +57,16 @@ class RoadScanColors extends ThemeExtension<RoadScanColors> {
   /// Overlay used to keep text legible over imagery.
   final Color scrim;
 
+  /// Outline for floating chrome sitting ON the map -- the action bar, the
+  /// round map buttons, the pitch control.
+  ///
+  /// Deliberately not [border]. Those controls are frosted glass over live map
+  /// content, so their outline has to contrast with the MAP, not with a panel
+  /// behind them. It therefore inverts: dark in light mode, light in dark
+  /// mode. Using a white hairline in both (as this did) left the controls with
+  /// no visible edge at all against a pale basemap.
+  final Color chromeBorder;
+
   /// Lets widgets branch on brightness without reaching for Theme.of again.
   final bool isDark;
 
@@ -71,6 +82,8 @@ class RoadScanColors extends ThemeExtension<RoadScanColors> {
     accent: Color(0xFF2E9CD6),
     accentSoft: Color(0x332E9CD6),
     scrim: Color(0xD8091521),
+    // White hairline over a dark basemap.
+    chromeBorder: Color(0x4DFFFFFF),
     isDark: true,
   );
 
@@ -89,6 +102,10 @@ class RoadScanColors extends ThemeExtension<RoadScanColors> {
     accent: Color(0xFF1B6CA8),
     accentSoft: Color(0x261B6CA8),
     scrim: Color(0xCCFFFFFF),
+    // Dark hairline over a pale basemap. Not pure black: at this alpha a
+    // neutral black hairline looks dirty against the map's warm paper tone,
+    // so this is the theme's own near-navy instead.
+    chromeBorder: Color(0x590E1A26),
     isDark: false,
   );
 
@@ -105,6 +122,7 @@ class RoadScanColors extends ThemeExtension<RoadScanColors> {
     Color? accent,
     Color? accentSoft,
     Color? scrim,
+    Color? chromeBorder,
     bool? isDark,
   }) {
     return RoadScanColors(
@@ -119,6 +137,7 @@ class RoadScanColors extends ThemeExtension<RoadScanColors> {
       accent: accent ?? this.accent,
       accentSoft: accentSoft ?? this.accentSoft,
       scrim: scrim ?? this.scrim,
+      chromeBorder: chromeBorder ?? this.chromeBorder,
       isDark: isDark ?? this.isDark,
     );
   }
@@ -138,6 +157,7 @@ class RoadScanColors extends ThemeExtension<RoadScanColors> {
       accent: Color.lerp(accent, other.accent, t)!,
       accentSoft: Color.lerp(accentSoft, other.accentSoft, t)!,
       scrim: Color.lerp(scrim, other.scrim, t)!,
+      chromeBorder: Color.lerp(chromeBorder, other.chromeBorder, t)!,
       // A half-faded theme still has to answer this; snap at the midpoint
       // rather than pretending it is meaningfully interpolable.
       isDark: t < 0.5 ? isDark : other.isDark,

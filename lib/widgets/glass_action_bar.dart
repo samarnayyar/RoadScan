@@ -41,21 +41,24 @@ class GlassActionBar extends StatelessWidget {
     // solid toolbar bolted to the bottom rather than glass floating over the
     // map.
     return Padding(
-      padding: const EdgeInsets.fromLTRB(44, 0, 44, 6),
+      // Kept short horizontally: a heavy inset is what makes this read as a
+      // floating pill rather than a toolbar docked to the screen edges. The
+      // extra presence comes from height below, not from length.
+      padding: const EdgeInsets.fromLTRB(46, 0, 46, 8),
       child: ClipRRect(
-        borderRadius: BorderRadius.circular(21),
+        // Radius tracks half the height, keeping it a true pill now that it
+        // is taller -- a fixed 21 would have left it looking like a rounded
+        // rectangle instead.
+        borderRadius: BorderRadius.circular(26),
         child: BackdropFilter(
           filter: ui.ImageFilter.blur(sigmaX: 34, sigmaY: 34),
           child: Container(
             decoration: BoxDecoration(
               color: glass.withValues(alpha: c.isDark ? 0.42 : 0.50),
-              borderRadius: BorderRadius.circular(21),
-              border: Border.all(
-                color: c.isDark
-                    ? Colors.white.withValues(alpha: 0.10)
-                    : Colors.white.withValues(alpha: 0.65),
-                width: 0.8,
-              ),
+              borderRadius: BorderRadius.circular(26),
+              // Contrasts with the MAP underneath, not with a panel: dark
+              // hairline in light mode, light hairline in dark mode.
+              border: Border.all(color: c.chromeBorder, width: 1.0),
               boxShadow: [
                 BoxShadow(
                   color: Colors.black.withValues(alpha: c.isDark ? 0.34 : 0.14),
@@ -67,9 +70,10 @@ class GlassActionBar extends StatelessWidget {
             child: SafeArea(
               top: false,
               child: SizedBox(
-                // 38px. The bar should sit under the map, not compete with it
-                // -- the map is the product.
-                height: 38,
+                // Thicker than the 38 it was, so the two actions have real
+                // presence and a comfortable tap target, without the bar
+                // growing sideways and turning back into a toolbar.
+                height: 52,
                 child: Row(
                   children: [
                     Expanded(
@@ -82,7 +86,7 @@ class GlassActionBar extends StatelessWidget {
                     ),
                     Container(
                       width: 1,
-                      margin: const EdgeInsets.symmetric(vertical: 10),
+                      margin: const EdgeInsets.symmetric(vertical: 14),
                       color: c.isDark
                           ? Colors.white.withValues(alpha: 0.12)
                           : Colors.black.withValues(alpha: 0.08),
@@ -140,12 +144,12 @@ class _GlassAction extends StatelessWidget {
           child: Row(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              Icon(icon, size: 16, color: accent),
-              const SizedBox(width: 6),
+              Icon(icon, size: 18, color: accent),
+              const SizedBox(width: 7),
               Text(
                 label,
                 style: TextStyle(
-                  fontSize: 12.5,
+                  fontSize: 13.5,
                   fontWeight: FontWeight.w600,
                   color: accent,
                   letterSpacing: -0.1,

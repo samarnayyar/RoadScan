@@ -35,9 +35,15 @@ class MapHomeScreen extends StatefulWidget {
   State<MapHomeScreen> createState() => _MapHomeScreenState();
 }
 
-class _MapHomeScreenState extends State<MapHomeScreen> {
+class _MapHomeScreenState extends State<MapHomeScreen>
+    with WidgetsBindingObserver {
   MapLibreMapController? _controller;
   StreamSubscription<Position>? _positionSub;
+  StreamSubscription<ServiceStatus>? _serviceSub;
+
+  /// True once the position stream is live. Guards the retry paths so
+  /// enabling location twice does not open two GPS subscriptions.
+  bool _locationActive = false;
 
   List<HazardReport> _reports = const [];
   bool _styleReady = false;
@@ -74,33 +80,63 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
   /// rebuild the lightweight overlays on top.
   Widget? _mapWidget;
 
-  /// The basemap style the cached [_mapWidget] was built with.
+  /// The basemap style currently applied to the live map.
   ///
-  /// MapLibreMap takes its style at construction, so a theme change has to
-  /// drop the cache and rebuild the platform view.
+  /// Theme changes go through `controller.setStyle()`, which swaps the style
+  /// on the EXISTING native view. The obvious alternative -- rebuilding the
+  /// MapLibreMap widget with a new `styleString` -- is what this used to do,
+  /// and it was slow and visibly janky: it tears down the native surface,
+  /// constructs a fresh one, refetches style, glyphs and sprites, re-adds
+  /// every layer and then has to restore the camera by hand. setStyle keeps
+  /// the surface and the camera, so only the style itself is refetched.
   String? _builtStyle;
 
-  /// Where the camera was when the style last changed.
-  ///
-  /// Rebuilding the map for a new style would otherwise drop the user back at
-  /// the area centre -- so switching theme while looking at a specific
-  /// junction threw away their position. Stashing the camera here and
-  /// restoring it after the new style loads makes the switch feel like a
-  /// repaint rather than a reset.
-  CameraPosition? _restoreCamera;
+  /// Guards against firing setStyle repeatedly while one is already in flight
+  /// (build can run several times before the new style finishes loading).
+  bool _styleSwapInFlight = false;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     DeviceIdentity.instance.id.then((id) {
       if (mounted) setState(() => _deviceId = id);
+    });
+
+    // Watch for the user flipping location on in system settings. This is the
+    // direct fix for "I turned GPS on and the map never noticed": the startup
+    // fix has already failed and been given up on by then, so something has to
+    // ask again.
+    _serviceSub = LocationService.instance.serviceStatus().listen((status) {
+      if (status == ServiceStatus.enabled) _retryLocation();
     });
   }
 
   @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // Covers the other half of the same problem: granting the PERMISSION
+    // (rather than switching the service on) happens in a system dialog or in
+    // Settings, and produces no ServiceStatus event at all. Coming back to the
+    // app is the reliable signal that something may have changed.
+    if (state == AppLifecycleState.resumed) _retryLocation();
+  }
+
+  @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _positionSub?.cancel();
+    _serviceSub?.cancel();
     super.dispose();
+  }
+
+  /// Starts location tracking if it is not already running and is now
+  /// possible. Safe to call repeatedly.
+  Future<void> _retryLocation() async {
+    if (_locationActive || !mounted) return;
+    if (!await LocationService.instance.isAvailable()) return;
+    if (!mounted) return;
+    setState(() => _error = null);
+    await _startLocation();
   }
 
   // ---------------------------------------------------------------------------
@@ -129,12 +165,25 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
       }
     }
 
+    // Bundled ML footprints, not the tile source's own buildings -- see
+    // MapLayers.addMlBuildings for why. Falls back to the OSM extrusion if
+    // the asset is missing, so a fresh clone without the bake still gets
+    // whatever 3D the basemap can offer.
     try {
-      await MapLayers.addBuildings(c);
+      await MapLayers.addMlBuildings(
+        c,
+        dark: _builtStyle == AppTheme.mapStyleDark,
+      );
     } catch (e) {
-      // A tile source without building heights shouldn't take the map down;
-      // the app is still fully usable in 2D.
-      debugPrint('RoadScan: 3D buildings unavailable: $e');
+      debugPrint('RoadScan: bundled buildings unavailable ($e); '
+          'falling back to OSM extrusion');
+      try {
+        await MapLayers.addBuildings(c);
+      } catch (e2) {
+        // A tile source without building heights shouldn't take the map down;
+        // the app is still fully usable in 2D.
+        debugPrint('RoadScan: 3D buildings unavailable: $e2');
+      }
     }
 
     // Everything outside the operating square, hatched off.
@@ -158,6 +207,28 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
     );
     await MapLayers.addPinLayers(c);
 
+    // Above the hazard pins: where you are is the one thing that must never be
+    // occluded, and on a dense stretch a cluster of pins would otherwise bury
+    // it.
+    try {
+      await MapLayers.addUserLayers(
+        c,
+        dark: _builtStyle == AppTheme.mapStyleDark,
+      );
+      // Re-seed immediately: on a theme re-style the stream will not tick
+      // again until the user physically moves, so without this the marker
+      // would simply vanish until then.
+      final last = LocationService.instance.lastKnown;
+      if (last != null) {
+        await c.setGeoJsonSource(
+          MapLayers.userSourceId,
+          MapLayers.userGeoJson(last.latitude, last.longitude),
+        );
+      }
+    } catch (e) {
+      debugPrint('RoadScan: user layers unavailable: $e');
+    }
+
     // After the pins, so a hazard marker is never hidden behind a place name.
     try {
       await MapLayers.addAreaLabels(
@@ -176,39 +247,32 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
     //
     // On a theme switch, go back to exactly where the user was instead of the
     // area centre -- see [_restoreCamera].
-    final restore = _restoreCamera;
-    await c.animateCamera(
-      CameraUpdate.newCameraPosition(
-        restore ??
-            CameraPosition(
-              target: _area.center,
-              zoom: _area.zoom,
-              tilt: AppConfig.initialPitch,
-              bearing: 0,
-            ),
-      ),
-      // Slow enough to read as flying in from the wide opening shot, but
-      // instant on a theme re-style, where any animation would look like the
-      // map lurching for no reason.
-      duration: restore != null
-          ? const Duration(milliseconds: 1)
-          : AppConfig.areaEntryDuration,
-    );
-    if (!mounted) return;
-    setState(() {
-      _pitch = restore?.tilt ?? AppConfig.initialPitch;
-      _bearing = restore?.bearing ?? 0;
-      _cameraReady = true;
-    });
-
-    if (restore != null) {
-      // A restore means this was a re-style, not a fresh open: the GPS
-      // subscription and pin cache are still live, so re-running them would
-      // yank the camera to the user's location and undo the restore.
-      _restoreCamera = null;
+    // A re-style keeps the camera, so there is nothing to fly to and the GPS
+    // subscription and pin cache are still live. Re-running the first-open
+    // path here would replay the fly-in and yank the camera off wherever the
+    // user was.
+    if (_cameraReady) {
       await _pushPins();
       return;
     }
+
+    await c.animateCamera(
+      CameraUpdate.newCameraPosition(
+        CameraPosition(
+          target: _area.center,
+          zoom: _area.zoom,
+          tilt: AppConfig.initialPitch,
+          bearing: 0,
+        ),
+      ),
+      duration: AppConfig.areaEntryDuration,
+    );
+    if (!mounted) return;
+    setState(() {
+      _pitch = AppConfig.initialPitch;
+      _bearing = 0;
+      _cameraReady = true;
+    });
 
     await _startLocation();
     await _refreshPins();
@@ -240,6 +304,11 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
   Future<void> _startLocation() async {
     try {
       final pos = await LocationService.instance.currentPosition();
+      _locationActive = true;
+      // Plot the marker before deciding where the camera goes -- even when the
+      // user is outside the corridor and the camera stays put, they should be
+      // able to see their own position relative to the square.
+      _updateUserMarker(pos);
       if (_withinBounds(pos.latitude, pos.longitude)) {
         await _flyTo(LatLng(pos.latitude, pos.longitude));
       } else {
@@ -254,12 +323,14 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
         }
       }
 
+      _locationActive = true;
       _positionSub?.cancel();
       _positionSub = LocationService.instance.watch().listen((p) {
         // Proximity alerting rides on the same position stream that drives the
         // map dot -- one GPS subscription, not two.
         ProximityAlerts.instance.onPosition(p, _reports);
         _updateLiveAlert(p);
+        _updateUserMarker(p);
       });
     } on LocationUnavailable catch (e) {
       if (!mounted) return;
@@ -451,6 +522,15 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
     });
   }
 
+  /// Moves the position marker. Cheap enough to run on every GPS tick --
+  /// it rewrites a one-feature GeoJSON source, it does not rebuild any widget.
+  void _updateUserMarker(Position p) {
+    _controller?.setGeoJsonSource(
+      MapLayers.userSourceId,
+      MapLayers.userGeoJson(p.latitude, p.longitude),
+    );
+  }
+
   /// Recentres on the user's live position, if that position is somewhere the
   /// camera is allowed to go.
   Future<void> _centreOnMe() async {
@@ -535,38 +615,40 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
   }
 
 
-  /// Constructed once per basemap style; see [_mapWidget] and [_builtStyle].
-  Widget _buildMap(String styleUrl) {
-    if (_mapWidget != null && _builtStyle == styleUrl) return _mapWidget!;
+  /// Applies a theme change to the live map without rebuilding it.
+  void _syncStyle(String styleUrl) {
+    if (_builtStyle == null || _builtStyle == styleUrl) return;
+    if (_styleSwapInFlight) return;
+    final c = _controller;
+    if (c == null) return;
 
-    // Style changed (theme switch): the layers we add in _onStyleLoaded belong
-    // to the old style object, so reset the readiness flags and let the new
-    // style's load callback re-add them. Stash the live camera first so the
-    // rebuild can pick up exactly where the user was.
-    if (_builtStyle != null) {
-      _restoreCamera = _controller?.cameraPosition;
-    }
+    _styleSwapInFlight = true;
     _builtStyle = styleUrl;
+    // The layers added in _onStyleLoaded belong to the OLD style object and
+    // are discarded with it; the new style's load callback re-adds them.
     _styleReady = false;
-    _cameraReady = false;
+    c.setStyle(styleUrl).whenComplete(() => _styleSwapInFlight = false);
+  }
 
-    final start = _restoreCamera;
+  /// Built exactly once. Theme changes go through [_syncStyle], never through
+  /// a rebuild -- see [_builtStyle].
+  Widget _buildMap(String styleUrl) {
+    if (_mapWidget != null) return _mapWidget!;
+    _builtStyle = styleUrl;
+
     return _mapWidget = RepaintBoundary(
-      key: ValueKey(styleUrl),
       child:
           MapLibreMap(
             styleString: styleUrl,
             // Opens wide and flat, then flies in to the area (see
             // _onStyleLoaded). Starting at the final zoom would make the
             // launch-screen "dive in" transition stop dead the moment the map
-            // appeared. On a theme re-style `start` is set, and we resume
-            // exactly where the user was instead of replaying the fly-in.
-            initialCameraPosition: start ??
-                CameraPosition(
-                  target: _area.center,
-                  zoom: AppConfig.areaEntryZoom,
-                  tilt: 0,
-                ),
+            // appeared.
+            initialCameraPosition: CameraPosition(
+              target: _area.center,
+              zoom: AppConfig.areaEntryZoom,
+              tilt: 0,
+            ),
             onMapCreated: _onMapCreated,
             onStyleLoadedCallback: _onStyleLoaded,
             onMapClick: _onMapClick,
@@ -577,15 +659,15 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
               AppConfig.minZoom,
               AppConfig.maxZoom,
             ),
-            myLocationEnabled: true,
-            // `none`, not `tracking`. With the camera clamped to the operating
-            // square, continuous tracking of a user standing OUTSIDE it pins
-            // the camera to the boundary on every GPS tick and makes the map
-            // impossible to pan -- the position it wants is illegal, so every
-            // manual pan snaps straight back. The dot still shows; the camera
-            // just stops chasing it.
+            // MapLibre's own location component is OFF; RoadScan draws the
+            // position itself (MapLayers.addUserLayers). Two reasons: the
+            // built-in dot is a fixed size that becomes almost invisible at
+            // corridor zoom, and its tracking mode had to be disabled anyway
+            // -- with the camera clamped to the operating square, tracking a
+            // user standing OUTSIDE it pinned the view to the boundary on
+            // every GPS tick and made the map impossible to pan.
+            myLocationEnabled: false,
             myLocationTrackingMode: MyLocationTrackingMode.none,
-            myLocationRenderMode: MyLocationRenderMode.compass,
             tiltGesturesEnabled: true,
             rotateGesturesEnabled: true,
             trackCameraPosition: true,
@@ -632,6 +714,13 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
         final dark = ThemeController.isDark(context, mode);
         final styleUrl =
             dark ? AppTheme.mapStyleDark : AppTheme.mapStyleLight;
+        // Swap the basemap after this frame: setStyle talks to the platform
+        // channel, and calling it during build would mutate the map while it
+        // is being laid out.
+        if (_builtStyle != null && _builtStyle != styleUrl) {
+          WidgetsBinding.instance
+              .addPostFrameCallback((_) => _syncStyle(styleUrl));
+        }
         return _buildScaffold(context, c, styleUrl);
       },
     );
@@ -662,7 +751,11 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
                       padding: const EdgeInsets.only(left: 12, top: 10),
                       child: Material(
                         color: c.surface.withValues(alpha: 0.94),
-                        shape: const CircleBorder(),
+                        // Had no outline at all, which left it the one piece
+                        // of map chrome with no edge.
+                        shape: CircleBorder(
+                          side: BorderSide(color: c.chromeBorder, width: 1.0),
+                        ),
                         child: IconButton(
                           icon: Icon(Icons.menu, size: 22, color: c.textPrimary),
                           tooltip: 'Menu',
@@ -739,6 +832,18 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
                             ),
                           ),
                           const SizedBox(height: 8),
+                          // Reset bearing to north. The needle rotates with
+                          // the map so it always shows which way north
+                          // currently is, and tapping snaps back -- the same
+                          // convention as the compass in PitchControl, which
+                          // is easy to miss over on the left.
+                          _MapGlassButton(
+                            icon: Icons.navigation_rounded,
+                            tooltip: 'Face north',
+                            iconRotation: -_bearing * math.pi / 180.0,
+                            onTap: _resetBearing,
+                          ),
+                          const SizedBox(height: 8),
                           // Needed now that the camera no longer follows GPS
                           // automatically -- without this there would be no
                           // way back to your own position.
@@ -780,11 +885,15 @@ class _MapGlassButton extends StatelessWidget {
     required this.icon,
     required this.tooltip,
     required this.onTap,
+    this.iconRotation,
   });
 
   final IconData icon;
   final String tooltip;
   final VoidCallback onTap;
+
+  /// Radians. Used by the compass so its needle tracks the map's bearing.
+  final double? iconRotation;
 
   @override
   Widget build(BuildContext context) {
@@ -799,18 +908,19 @@ class _MapGlassButton extends StatelessWidget {
           child: Material(
             color: glass.withValues(alpha: c.isDark ? 0.55 : 0.62),
             shape: CircleBorder(
-              side: BorderSide(
-                color: c.isDark
-                    ? Colors.white.withValues(alpha: 0.14)
-                    : Colors.white.withValues(alpha: 0.7),
-              ),
+              side: BorderSide(color: c.chromeBorder, width: 1.0),
             ),
             child: InkWell(
               customBorder: const CircleBorder(),
               onTap: onTap,
               child: Padding(
                 padding: const EdgeInsets.all(10),
-                child: Icon(icon, size: 19, color: c.textPrimary),
+                child: iconRotation == null
+                    ? Icon(icon, size: 19, color: c.textPrimary)
+                    : Transform.rotate(
+                        angle: iconRotation!,
+                        child: Icon(icon, size: 19, color: c.textPrimary),
+                      ),
               ),
             ),
           ),

@@ -32,7 +32,9 @@ class PitchControl extends StatelessWidget {
       decoration: BoxDecoration(
         color: c.surface.withValues(alpha: 0.94),
         borderRadius: BorderRadius.circular(22),
-        border: Border.all(color: c.border.withValues(alpha: 0.6)),
+        // chromeBorder, not border: this floats on the map, so its outline
+        // has to contrast with the basemap rather than with a surface.
+        border: Border.all(color: c.chromeBorder, width: 1.0),
         boxShadow: const [
           BoxShadow(color: Color(0x22000000), blurRadius: 10, offset: Offset(0, 2)),
         ],
