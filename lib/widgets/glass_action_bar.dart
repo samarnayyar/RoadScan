@@ -34,36 +34,42 @@ class GlassActionBar extends StatelessWidget {
     // produced a bright slab that fought the map instead of sitting over it.
     final glass = c.isDark ? const Color(0xFF16293A) : Colors.white;
 
+    // Sized and styled after iOS's floating glass controls: a tight pill that
+    // hugs its content, heavy blur, a very low-alpha fill, and a fine
+    // light-catching hairline along the top edge. The previous bar stretched
+    // nearly edge to edge at 46px with a flat 55% white fill, which read as a
+    // solid toolbar bolted to the bottom rather than glass floating over the
+    // map.
     return Padding(
-      padding: const EdgeInsets.fromLTRB(26, 0, 26, 10),
+      padding: const EdgeInsets.fromLTRB(44, 0, 44, 6),
       child: ClipRRect(
-        borderRadius: BorderRadius.circular(26),
+        borderRadius: BorderRadius.circular(21),
         child: BackdropFilter(
-          filter: ui.ImageFilter.blur(sigmaX: 24, sigmaY: 24),
+          filter: ui.ImageFilter.blur(sigmaX: 34, sigmaY: 34),
           child: Container(
             decoration: BoxDecoration(
-              color: glass.withValues(alpha: c.isDark ? 0.62 : 0.55),
-              borderRadius: BorderRadius.circular(26),
+              color: glass.withValues(alpha: c.isDark ? 0.42 : 0.50),
+              borderRadius: BorderRadius.circular(21),
               border: Border.all(
                 color: c.isDark
-                    ? Colors.white.withValues(alpha: 0.14)
-                    : Colors.white.withValues(alpha: 0.75),
-                width: 1,
+                    ? Colors.white.withValues(alpha: 0.10)
+                    : Colors.white.withValues(alpha: 0.65),
+                width: 0.8,
               ),
-              boxShadow: const [
+              boxShadow: [
                 BoxShadow(
-                  color: Color(0x1F000000),
-                  blurRadius: 20,
-                  offset: Offset(0, 6),
+                  color: Colors.black.withValues(alpha: c.isDark ? 0.34 : 0.14),
+                  blurRadius: 22,
+                  offset: const Offset(0, 8),
                 ),
               ],
             ),
             child: SafeArea(
               top: false,
               child: SizedBox(
-                // Half the previous height. The bar should sit under the map,
-                // not compete with it -- the map is the product.
-                height: 46,
+                // 38px. The bar should sit under the map, not compete with it
+                // -- the map is the product.
+                height: 38,
                 child: Row(
                   children: [
                     Expanded(
@@ -76,10 +82,10 @@ class GlassActionBar extends StatelessWidget {
                     ),
                     Container(
                       width: 1,
-                      margin: const EdgeInsets.symmetric(vertical: 11),
+                      margin: const EdgeInsets.symmetric(vertical: 10),
                       color: c.isDark
-                          ? Colors.white.withValues(alpha: 0.14)
-                          : Colors.black.withValues(alpha: 0.10),
+                          ? Colors.white.withValues(alpha: 0.12)
+                          : Colors.black.withValues(alpha: 0.08),
                     ),
                     Expanded(
                       child: _GlassAction(
@@ -134,15 +140,15 @@ class _GlassAction extends StatelessWidget {
           child: Row(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              Icon(icon, size: 19, color: accent),
-              const SizedBox(width: 7),
+              Icon(icon, size: 16, color: accent),
+              const SizedBox(width: 6),
               Text(
                 label,
                 style: TextStyle(
-                  fontSize: 13.5,
+                  fontSize: 12.5,
                   fontWeight: FontWeight.w600,
                   color: accent,
-                  letterSpacing: -0.2,
+                  letterSpacing: -0.1,
                 ),
               ),
             ],

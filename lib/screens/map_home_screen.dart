@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:math' as math;
+import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 import 'package:geolocator/geolocator.dart';
@@ -76,11 +77,17 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
   /// The basemap style the cached [_mapWidget] was built with.
   ///
   /// MapLibreMap takes its style at construction, so a theme change has to
-  /// drop the cache and rebuild the platform view. That resets the camera to
-  /// the area centre, which is a visible jump -- acceptable because switching
-  /// theme is rare and deliberate, and the user is expecting the map to change
-  /// appearance anyway.
+  /// drop the cache and rebuild the platform view.
   String? _builtStyle;
+
+  /// Where the camera was when the style last changed.
+  ///
+  /// Rebuilding the map for a new style would otherwise drop the user back at
+  /// the area centre -- so switching theme while looking at a specific
+  /// junction threw away their position. Stashing the camera here and
+  /// restoring it after the new style loads makes the switch feel like a
+  /// repaint rather than a reset.
+  CameraPosition? _restoreCamera;
 
   @override
   void initState() {
@@ -130,42 +137,122 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
       debugPrint('RoadScan: 3D buildings unavailable: $e');
     }
 
+    // Everything outside the operating square, hatched off.
+    try {
+      String? hatchId;
+      final hatch = await MapLayers.makeHatchImage();
+      if (hatch != null) {
+        hatchId = 'roadscan-hatch';
+        await c.addImage(hatchId, hatch);
+      }
+      await MapLayers.addBoundsMask(c, hatchImageId: hatchId);
+    } catch (e) {
+      // The camera clamp is the real restriction; the mask is the visible
+      // explanation of it. Losing the mask must not lose the map.
+      debugPrint('RoadScan: bounds mask unavailable: $e');
+    }
+
     await c.addGeoJsonSource(
       MapLayers.pinSourceId,
       MapLayers.pinsGeoJson(const []),
     );
     await MapLayers.addPinLayers(c);
 
+    // After the pins, so a hazard marker is never hidden behind a place name.
+    try {
+      await MapLayers.addAreaLabels(
+        c,
+        dark: _builtStyle == AppTheme.mapStyleDark,
+      );
+    } catch (e) {
+      debugPrint('RoadScan: area labels unavailable: $e');
+    }
+
     if (!mounted) return;
     setState(() => _styleReady = true);
 
     // Apply the tilt explicitly rather than trusting initialCameraPosition.
     // This is what actually makes the map read as 3D.
+    //
+    // On a theme switch, go back to exactly where the user was instead of the
+    // area centre -- see [_restoreCamera].
+    final restore = _restoreCamera;
     await c.animateCamera(
       CameraUpdate.newCameraPosition(
-        CameraPosition(
-          target: _area.center,
-          zoom: _area.zoom,
-          tilt: AppConfig.initialPitch,
-          bearing: 0,
-        ),
+        restore ??
+            CameraPosition(
+              target: _area.center,
+              zoom: _area.zoom,
+              tilt: AppConfig.initialPitch,
+              bearing: 0,
+            ),
       ),
-      duration: const Duration(milliseconds: 600),
+      // Slow enough to read as flying in from the wide opening shot, but
+      // instant on a theme re-style, where any animation would look like the
+      // map lurching for no reason.
+      duration: restore != null
+          ? const Duration(milliseconds: 1)
+          : AppConfig.areaEntryDuration,
     );
     if (!mounted) return;
     setState(() {
-      _pitch = AppConfig.initialPitch;
+      _pitch = restore?.tilt ?? AppConfig.initialPitch;
+      _bearing = restore?.bearing ?? 0;
       _cameraReady = true;
     });
+
+    if (restore != null) {
+      // A restore means this was a re-style, not a fresh open: the GPS
+      // subscription and pin cache are still live, so re-running them would
+      // yank the camera to the user's location and undo the restore.
+      _restoreCamera = null;
+      await _pushPins();
+      return;
+    }
 
     await _startLocation();
     await _refreshPins();
   }
 
+  /// Pushes the cached pins into the (possibly new) style's source.
+  Future<void> _pushPins() async {
+    await _controller?.setGeoJsonSource(
+      MapLayers.pinSourceId,
+      MapLayers.pinsGeoJson(_reports),
+    );
+  }
+
+  /// True when a fix falls inside the operating square.
+  ///
+  /// Matters because the camera is hard-clamped to that square: flying to a
+  /// position outside it does not show the user where they are, it shoves the
+  /// camera against the nearest boundary and strands them looking at the edge
+  /// of the mask. Better to stay on the area they actually chose.
+  static bool _withinBounds(double lat, double lon) {
+    final sw = AppConfig.corridorSouthWest;
+    final ne = AppConfig.corridorNorthEast;
+    return lat >= sw.latitude &&
+        lat <= ne.latitude &&
+        lon >= sw.longitude &&
+        lon <= ne.longitude;
+  }
+
   Future<void> _startLocation() async {
     try {
       final pos = await LocationService.instance.currentPosition();
-      await _flyTo(LatLng(pos.latitude, pos.longitude));
+      if (_withinBounds(pos.latitude, pos.longitude)) {
+        await _flyTo(LatLng(pos.latitude, pos.longitude));
+      } else {
+        // Outside the corridor -- stay on the chosen area and say why, rather
+        // than silently parking at the boundary.
+        await _flyTo(_area.center);
+        if (mounted) {
+          setState(() => _error =
+              'You are outside the mapped corridor, so the map is showing '
+              '${_area.name}. Reporting still works once you are inside the '
+              'highlighted square.');
+        }
+      }
 
       _positionSub?.cancel();
       _positionSub = LocationService.instance.watch().listen((p) {
@@ -364,12 +451,41 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
     });
   }
 
+  /// Recentres on the user's live position, if that position is somewhere the
+  /// camera is allowed to go.
+  Future<void> _centreOnMe() async {
+    try {
+      final pos = await LocationService.instance.currentPosition();
+      if (!mounted) return;
+      if (!_withinBounds(pos.latitude, pos.longitude)) {
+        ScaffoldMessenger.of(context)
+          ..hideCurrentSnackBar()
+          ..showSnackBar(const SnackBar(
+            content: Text('You are outside the mapped corridor.'),
+            duration: Duration(seconds: 3),
+          ));
+        return;
+      }
+      await _flyTo(LatLng(pos.latitude, pos.longitude));
+    } on LocationUnavailable catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(SnackBar(
+          content: Text(e.message),
+          duration: const Duration(seconds: 3),
+        ));
+    }
+  }
+
   Future<void> _switchArea() async {
     // Popping back to the launch screen keeps one source of truth for the area
     // rather than duplicating the picker inside the map.
-    if (Navigator.of(context).canPop()) {
-      Navigator.of(context).pop();
-    }
+    //
+    // popUntil rather than a single pop: the user may have a detail sheet or a
+    // pushed screen above the map, and a lone pop would only close that, which
+    // looks like the button did nothing.
+    Navigator.of(context).popUntil((route) => route.isFirst);
   }
 
   // ---------------------------------------------------------------------------
@@ -425,21 +541,32 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
 
     // Style changed (theme switch): the layers we add in _onStyleLoaded belong
     // to the old style object, so reset the readiness flags and let the new
-    // style's load callback re-add them.
+    // style's load callback re-add them. Stash the live camera first so the
+    // rebuild can pick up exactly where the user was.
+    if (_builtStyle != null) {
+      _restoreCamera = _controller?.cameraPosition;
+    }
     _builtStyle = styleUrl;
     _styleReady = false;
     _cameraReady = false;
 
+    final start = _restoreCamera;
     return _mapWidget = RepaintBoundary(
       key: ValueKey(styleUrl),
       child:
           MapLibreMap(
             styleString: styleUrl,
-            initialCameraPosition: CameraPosition(
-              target: _area.center,
-              zoom: _area.zoom,
-              tilt: AppConfig.initialPitch,
-            ),
+            // Opens wide and flat, then flies in to the area (see
+            // _onStyleLoaded). Starting at the final zoom would make the
+            // launch-screen "dive in" transition stop dead the moment the map
+            // appeared. On a theme re-style `start` is set, and we resume
+            // exactly where the user was instead of replaying the fly-in.
+            initialCameraPosition: start ??
+                CameraPosition(
+                  target: _area.center,
+                  zoom: AppConfig.areaEntryZoom,
+                  tilt: 0,
+                ),
             onMapCreated: _onMapCreated,
             onStyleLoadedCallback: _onStyleLoaded,
             onMapClick: _onMapClick,
@@ -451,12 +578,29 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
               AppConfig.maxZoom,
             ),
             myLocationEnabled: true,
-            myLocationTrackingMode: MyLocationTrackingMode.tracking,
+            // `none`, not `tracking`. With the camera clamped to the operating
+            // square, continuous tracking of a user standing OUTSIDE it pins
+            // the camera to the boundary on every GPS tick and makes the map
+            // impossible to pan -- the position it wants is illegal, so every
+            // manual pan snaps straight back. The dot still shows; the camera
+            // just stops chasing it.
+            myLocationTrackingMode: MyLocationTrackingMode.none,
             myLocationRenderMode: MyLocationRenderMode.compass,
             tiltGesturesEnabled: true,
             rotateGesturesEnabled: true,
-            compassEnabled: true,
             trackCameraPosition: true,
+            // MapLibre's own compass is switched OFF, not repositioned. It
+            // landed top-right under the stats bar, and it duplicated the
+            // compass already built into PitchControl, which sits next to the
+            // tilt slider it belongs with. Two compasses in different corners
+            // disagreeing about where north is looks like a bug.
+            compassEnabled: false,
+            // The attribution "i" defaults to the bottom-right, where it
+            // collided with the action bar. Moved to the top-left under the
+            // menu button: still present (it is a licence requirement, not
+            // decoration) but out of the thumb path.
+            attributionButtonPosition: AttributionButtonPosition.topLeft,
+            attributionButtonMargins: const math.Point(12, 74),
             onCameraIdle: () {
               // Ignore idle events fired before we positioned the camera.
               if (!_cameraReady) return;
@@ -579,6 +723,38 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
                         onResetBearing: _resetBearing,
                       ),
                       const Spacer(),
+                      // Theme and home, as round glass buttons stacked on the
+                      // right. Both were previously only reachable through the
+                      // drawer (theme) or by tapping the area name (home),
+                      // neither of which is discoverable mid-ride.
+                      Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          ValueListenableBuilder<ThemeMode>(
+                            valueListenable: ThemeController.instance.mode,
+                            builder: (context, m, _) => _MapGlassButton(
+                              icon: ThemeController.icon(m),
+                              tooltip: 'Theme: ${ThemeController.label(m)}',
+                              onTap: () => ThemeController.instance.cycle(),
+                            ),
+                          ),
+                          const SizedBox(height: 8),
+                          // Needed now that the camera no longer follows GPS
+                          // automatically -- without this there would be no
+                          // way back to your own position.
+                          _MapGlassButton(
+                            icon: Icons.my_location_rounded,
+                            tooltip: 'Centre on me',
+                            onTap: _centreOnMe,
+                          ),
+                          const SizedBox(height: 8),
+                          _MapGlassButton(
+                            icon: Icons.grid_view_rounded,
+                            tooltip: 'Change area',
+                            onTap: _switchArea,
+                          ),
+                        ],
+                      ),
                     ],
                   ),
                 ),
@@ -590,6 +766,55 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
             ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+/// A round frosted button for the map's own controls.
+///
+/// Matches the action bar's material so the map chrome reads as one system
+/// rather than as buttons borrowed from three different screens.
+class _MapGlassButton extends StatelessWidget {
+  const _MapGlassButton({
+    required this.icon,
+    required this.tooltip,
+    required this.onTap,
+  });
+
+  final IconData icon;
+  final String tooltip;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = context.rs;
+    final glass = c.isDark ? const Color(0xFF16293A) : Colors.white;
+
+    return Tooltip(
+      message: tooltip,
+      child: ClipOval(
+        child: BackdropFilter(
+          filter: ui.ImageFilter.blur(sigmaX: 18, sigmaY: 18),
+          child: Material(
+            color: glass.withValues(alpha: c.isDark ? 0.55 : 0.62),
+            shape: CircleBorder(
+              side: BorderSide(
+                color: c.isDark
+                    ? Colors.white.withValues(alpha: 0.14)
+                    : Colors.white.withValues(alpha: 0.7),
+              ),
+            ),
+            child: InkWell(
+              customBorder: const CircleBorder(),
+              onTap: onTap,
+              child: Padding(
+                padding: const EdgeInsets.all(10),
+                child: Icon(icon, size: 19, color: c.textPrimary),
+              ),
+            ),
+          ),
+        ),
       ),
     );
   }

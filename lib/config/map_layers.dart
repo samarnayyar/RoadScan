@@ -1,7 +1,12 @@
+import 'dart:typed_data';
+import 'dart:ui' as ui;
+
+import 'package:flutter/material.dart';
 import 'package:maplibre_gl/maplibre_gl.dart';
 
 import '../models/detection.dart';
 import '../models/hazard_report.dart';
+import 'app_config.dart';
 
 /// Builds the style layers RoadScan adds on top of the base map, and the
 /// GeoJSON the pin layers read.
@@ -13,6 +18,13 @@ class MapLayers {
 
   static const String buildingsLayerId = 'roadscan-3d-buildings';
   static const String roadsLayerId = 'roadscan-road-contrast';
+  static const String areaLabelSourceId = 'roadscan-area-labels';
+  static const String areaLabelHaloLayerId = 'roadscan-area-labels-halo';
+  static const String areaLabelLayerId = 'roadscan-area-labels-text';
+  static const String maskSourceId = 'roadscan-bounds-mask';
+  static const String maskFillLayerId = 'roadscan-bounds-mask-fill';
+  static const String maskHatchLayerId = 'roadscan-bounds-mask-hatch';
+  static const String maskEdgeLayerId = 'roadscan-bounds-edge';
   static const String pinSourceId = 'roadscan-pins';
   static const String pinGlowLayerId = 'roadscan-pins-glow';
   static const String pinCoreLayerId = 'roadscan-pins-core';
@@ -116,6 +128,284 @@ class MapLayers {
       minzoom: 14.0,
       enableInteraction: false,
     );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Area labels
+  // ---------------------------------------------------------------------------
+
+  static Map<String, dynamic> _areaLabelGeoJson() => {
+        'type': 'FeatureCollection',
+        'features': [
+          for (final a in AppConfig.areas)
+            {
+              'type': 'Feature',
+              'id': a.id,
+              'geometry': {
+                'type': 'Point',
+                'coordinates': [a.center.longitude, a.center.latitude],
+              },
+              'properties': {
+                'id': a.id,
+                'name': a.name.toUpperCase(),
+              },
+            },
+        ],
+      };
+
+  /// Names the four areas directly on the map.
+  ///
+  /// Without these the only clue to which stretch you are looking at is the
+  /// header, which names the area you *entered* from -- not the one you have
+  /// since panned to. The corridor is 8 km of visually similar hill road, so
+  /// that gap was real.
+  ///
+  /// Two layers rather than one: a dot beneath anchors the name to an actual
+  /// point (a floating word over a road reads as a map label from the
+  /// basemap, not as one of ours), and the text sits above it.
+  ///
+  /// Sizing runs BACKWARDS from the usual convention -- larger when zoomed
+  /// out, smaller when zoomed in. Zoomed out these are the primary way to
+  /// orient; zoomed in you are looking at individual potholes and the names
+  /// should get out of the way.
+  static Future<void> addAreaLabels(
+    MapLibreMapController c, {
+    required bool dark,
+  }) async {
+    await c.addGeoJsonSource(areaLabelSourceId, _areaLabelGeoJson());
+
+    await c.addCircleLayer(
+      areaLabelSourceId,
+      areaLabelHaloLayerId,
+      CircleLayerProperties(
+        circleRadius: [
+          'interpolate',
+          ['linear'],
+          ['zoom'],
+          13, 5.0,
+          16, 3.5,
+          18, 2.5,
+        ],
+        circleColor: dark ? '#7FD4FF' : '#1B6CA8',
+        circleOpacity: 0.9,
+        circleStrokeColor: dark ? '#0A141F' : '#FFFFFF',
+        circleStrokeWidth: 1.5,
+        circleStrokeOpacity: 0.8,
+      ),
+      enableInteraction: false,
+    );
+
+    await c.addSymbolLayer(
+      areaLabelSourceId,
+      areaLabelLayerId,
+      SymbolLayerProperties(
+        textField: ['get', 'name'],
+        textSize: [
+          'interpolate',
+          ['linear'],
+          ['zoom'],
+          13, 16.0,
+          15, 14.0,
+          17, 11.5,
+        ],
+        textColor: dark ? '#FFFFFF' : '#0E1A26',
+        // A heavy halo in the background colour is what keeps these readable
+        // over a busy road network without a filled plate behind them.
+        textHaloColor: dark ? '#050D16' : '#FFFFFF',
+        textHaloWidth: 2.0,
+        textHaloBlur: 0.4,
+        textLetterSpacing: 0.12,
+        // Tight to its dot. A larger offset floated the name far enough from
+        // the anchor that the two stopped reading as one thing.
+        textOffset: [0, -0.7],
+        textAnchor: 'bottom',
+        // Collision padding around the glyph box. Note this does NOT keep a
+        // label out from under the stats header -- MapLibre has no viewport
+        // inset for symbol placement, so a name can still sit behind the
+        // header when its area is near the top of the screen. That is normal
+        // slippy-map behaviour (the label reappears as you pan) and the area
+        // you actually opened is centred, so it is not the one occluded.
+        textPadding: 2.0,
+        // ONE font, not a fallback stack.
+        //
+        // MapLibre does not try a stack font-by-font: it joins the whole list
+        // into a single glyph URL, so ['Noto Sans Bold', 'Noto Sans Regular']
+        // requested `/fonts/Noto Sans Bold,Noto Sans Regular/0-255.pbf`, got a
+        // 404, and the layer silently rendered nothing. Verified against
+        // OpenFreeMap directly: 'Noto Sans Bold' and 'Noto Sans Regular' each
+        // return 200 on their own, the combination does not.
+        textFont: const ['Noto Sans Bold'],
+        // These must always be visible -- they are the orientation aid, so
+        // letting the collision engine drop them defeats the purpose.
+        textAllowOverlap: true,
+        textIgnorePlacement: true,
+      ),
+      enableInteraction: false,
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Out-of-bounds mask
+  // ---------------------------------------------------------------------------
+
+  /// A world-covering polygon with the operating square punched out of it.
+  ///
+  /// GeoJSON polygons take an outer ring followed by hole rings, so this is
+  /// literally "the whole world, minus the square". Painting the OUTSIDE is
+  /// what makes the restriction feel deliberate: shading the inside would
+  /// imply the corridor is the thing being excluded.
+  ///
+  /// The outer ring stops at +/-85 degrees rather than +/-90 because Web
+  /// Mercator is undefined at the poles -- 90 would produce an infinite
+  /// projected coordinate and the fill would simply not draw.
+  static Map<String, dynamic> _maskGeoJson() {
+    final sw = AppConfig.corridorSouthWest;
+    final ne = AppConfig.corridorNorthEast;
+
+    return {
+      'type': 'FeatureCollection',
+      'features': [
+        {
+          'type': 'Feature',
+          'properties': const {},
+          'geometry': {
+            'type': 'Polygon',
+            'coordinates': [
+              // Outer ring: the world.
+              const [
+                [-180.0, -85.0],
+                [180.0, -85.0],
+                [180.0, 85.0],
+                [-180.0, 85.0],
+                [-180.0, -85.0],
+              ],
+              // Hole: the square the user is allowed inside.
+              [
+                [sw.longitude, sw.latitude],
+                [ne.longitude, sw.latitude],
+                [ne.longitude, ne.latitude],
+                [sw.longitude, ne.latitude],
+                [sw.longitude, sw.latitude],
+              ],
+            ],
+          },
+        },
+      ],
+    };
+  }
+
+  /// The square's own outline, drawn as a separate line feature.
+  ///
+  /// Kept separate from the mask polygon because a line layer on a polygon
+  /// with a hole would stroke the world ring too, drawing a stray border
+  /// along the antimeridian.
+  static Map<String, dynamic> _edgeGeoJson() {
+    final sw = AppConfig.corridorSouthWest;
+    final ne = AppConfig.corridorNorthEast;
+    return {
+      'type': 'FeatureCollection',
+      'features': [
+        {
+          'type': 'Feature',
+          'properties': const {},
+          'geometry': {
+            'type': 'LineString',
+            'coordinates': [
+              [sw.longitude, sw.latitude],
+              [ne.longitude, sw.latitude],
+              [ne.longitude, ne.latitude],
+              [sw.longitude, ne.latitude],
+              [sw.longitude, sw.latitude],
+            ],
+          },
+        },
+      ],
+    };
+  }
+
+  /// Masks everything outside the operating square and outlines it.
+  ///
+  /// [hatchImageId] is an optional registered image name (see
+  /// [makeHatchImage]); when supplied, a diagonal-stripe pattern is drawn over
+  /// the flat fill so the excluded region reads as "off limits" the way a
+  /// hatched exclusion zone does on a plan, rather than merely as dimmed map.
+  static Future<void> addBoundsMask(
+    MapLibreMapController c, {
+    String? hatchImageId,
+  }) async {
+    await c.addGeoJsonSource(maskSourceId, _maskGeoJson());
+    await c.addGeoJsonSource('$maskSourceId-edge', _edgeGeoJson());
+
+    await c.addFillLayer(
+      maskSourceId,
+      maskFillLayerId,
+      const FillLayerProperties(
+        fillColor: '#0B2A4A',
+        // Heavy enough to kill legibility outside (that is the point) but not
+        // opaque -- seeing a ghost of the surrounding roads tells the user
+        // where they are relative to the corridor.
+        fillOpacity: 0.82,
+      ),
+      enableInteraction: false,
+    );
+
+    if (hatchImageId != null) {
+      await c.addFillLayer(
+        maskSourceId,
+        maskHatchLayerId,
+        FillLayerProperties(
+          fillPattern: hatchImageId,
+          // Light touch. The hatch only needs to say "not here"; at higher
+          // opacity it turned into a texture that competed with the real map
+          // inside the square for attention.
+          fillOpacity: 0.28,
+        ),
+        enableInteraction: false,
+      );
+    }
+
+    await c.addLineLayer(
+      '$maskSourceId-edge',
+      maskEdgeLayerId,
+      const LineLayerProperties(
+        lineColor: '#4FB8ED',
+        lineWidth: 1.8,
+        lineOpacity: 0.55,
+      ),
+      enableInteraction: false,
+    );
+  }
+
+  /// Builds a small diagonal-stripe tile to use as the mask's fill pattern.
+  ///
+  /// Generated at runtime rather than shipped as an asset: it is twelve lines
+  /// of drawing code, scales to whatever DPR the device has, and avoids
+  /// another binary in the repo.
+  static Future<Uint8List?> makeHatchImage({int size = 16}) async {
+    try {
+      final recorder = ui.PictureRecorder();
+      final canvas = Canvas(recorder);
+      final paint = Paint()
+        ..color = const Color(0xFF6FC7F5).withValues(alpha: 0.45)
+        ..strokeWidth = 1.2
+        ..strokeCap = StrokeCap.square;
+
+      // Two parallel diagonals, offset by the tile size, so the pattern is
+      // seamless when repeated.
+      final s = size.toDouble();
+      canvas.drawLine(Offset(0, s), Offset(s, 0), paint);
+      canvas.drawLine(Offset(-1, 1), Offset(1, -1), paint);
+      canvas.drawLine(Offset(s - 1, s + 1), Offset(s + 1, s - 1), paint);
+
+      final image = await recorder.endRecording().toImage(size, size);
+      final data = await image.toByteData(format: ui.ImageByteFormat.png);
+      image.dispose();
+      return data?.buffer.asUint8List();
+    } catch (e) {
+      // A missing pattern is cosmetic -- the flat fill still masks the area.
+      debugPrint('RoadScan: hatch pattern unavailable: $e');
+      return null;
+    }
   }
 
   /// Converts pins to GeoJSON.
