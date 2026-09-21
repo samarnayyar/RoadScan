@@ -111,6 +111,17 @@ class _MapHomeScreenState extends State<MapHomeScreen> {
     final c = _controller;
     if (c == null) return;
 
+    // Dark basemap only: `liberty` already draws roads with plenty of
+    // contrast, but OpenFreeMap's `dark` style makes them nearly invisible.
+    // See MapLayers.addRoadContrast.
+    if (_builtStyle == AppTheme.mapStyleDark) {
+      try {
+        await MapLayers.addRoadContrast(c);
+      } catch (e) {
+        debugPrint('RoadScan: road contrast layer unavailable: $e');
+      }
+    }
+
     try {
       await MapLayers.addBuildings(c);
     } catch (e) {

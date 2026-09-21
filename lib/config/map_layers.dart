@@ -23,6 +23,63 @@ class MapLayers {
   /// this and [_buildingSourceLayer] are what break.
   static const String _vectorSourceId = 'openmaptiles';
   static const String _buildingSourceLayer = 'building';
+  static const String _transportSourceLayer = 'transportation';
+
+  /// Redraws the road network on top of the dark basemap.
+  ///
+  /// OpenFreeMap's `dark` style paints roads only a shade lighter than its
+  /// rgb(12,12,12) background. On the dense parts of the corridor that reads
+  /// as moody; on a rural stretch like Kandholi the roads effectively vanish,
+  /// which is unusable for an app whose entire job is telling you what is on
+  /// the road ahead.
+  ///
+  /// Rather than switch to a washed-out slate basemap, this draws the
+  /// `transportation` source-layer back over the top at a legible contrast.
+  /// Width scales with zoom so the lines stay hairlines when zoomed out and
+  /// become real roads up close, and motorway/trunk/primary are drawn heavier
+  /// than residential so the hierarchy survives.
+  ///
+  /// Light mode does not need this -- `liberty` already has strong road
+  /// contrast -- so the map screen only adds it for the dark theme.
+  static Future<void> addRoadContrast(MapLibreMapController c) async {
+    await c.addLineLayer(
+      _vectorSourceId,
+      roadsLayerId,
+      LineLayerProperties(
+        lineColor: [
+          'match',
+          ['get', 'class'],
+          'motorway', '#7FB2D9',
+          'trunk', '#7FB2D9',
+          'primary', '#6E9CC4',
+          'secondary', '#5D86AB',
+          '#4A6B88', // everything else: residential, service, track
+        ],
+        lineWidth: [
+          'interpolate',
+          ['exponential', 1.5],
+          ['zoom'],
+          10, 0.4,
+          14, 1.4,
+          16, 2.6,
+          19, 8.0,
+        ],
+        lineOpacity: 0.85,
+        lineCap: 'round',
+        lineJoin: 'round',
+      ),
+      sourceLayer: _transportSourceLayer,
+      // Paths and steps are not driveable and would only add clutter.
+      filter: [
+        '!in',
+        ['get', 'class'],
+        'path',
+        'footway',
+        'steps',
+      ],
+      enableInteraction: false,
+    );
+  }
 
   /// Extrudes OSM building footprints into 3D.
   ///
