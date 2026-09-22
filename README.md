@@ -319,3 +319,4 @@ Postgres: a renamed RPC, a constant tuned in `app_config.dart` but not in the
 schema (or vice versa), a result key the Dart reads that the SQL never
 produces, a missing `grant`, or an OUT parameter that would shadow a table or
 column inside PL/pgSQL. Run it after editing either side.
+
