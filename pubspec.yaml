@@ -78,3 +78,13 @@ flutter:
     # OSM has only 151 buildings here, which is why the 3D map looked
     # deserted. (c) Microsoft, ODbL -- credited on the map.
     - assets/buildings.geojson
+    # Waterways and the main corridor, baked by tool/fetch_overlays.py. Both
+    # are drawn in fixed colours that ignore the theme, because they are
+    # orientation landmarks -- see MapLayers.addWater / addCorridor.
+    # (c) OpenStreetMap contributors, ODbL; corridor routed with OSRM.
+    - assets/rivers.geojson
+    - assets/corridor.geojson
+    # App mark, generated from logo.jpg by tool/make_icons.py (which also
+    # writes the Android launcher icons). Transparent, so it sits on any of
+    # the three themes.
+    - assets/brand/

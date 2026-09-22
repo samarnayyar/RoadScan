@@ -97,9 +97,13 @@ class RoadScanColors extends ThemeExtension<RoadScanColors> {
     accent: Color(0xFF2E9CD6),
     accentSoft: Color(0x332E9CD6),
     scrim: Color(0xD8091521),
-    // Fully opaque white. A translucent hairline picked up whatever was under
-    // it and read as muddy rather than as a defined edge.
-    chromeBorder: Color(0xFFFFFFFF),
+    // Mid grey, well down from white.
+    //
+    // Still fully OPAQUE -- a translucent hairline picks up whatever is behind
+    // it and reads as muddy rather than as an edge, which is why this was made
+    // solid in the first place. The harshness was the hue, not the alpha, so
+    // the value keeps coming down while the edge stays crisp.
+    chromeBorder: Color(0xFF808B96),
     isDark: true,
     kind: AppThemeKind.dark,
   );
@@ -147,10 +151,13 @@ class RoadScanColors extends ThemeExtension<RoadScanColors> {
     accent: Color(0xFF1B6CA8),
     accentSoft: Color(0x261B6CA8),
     scrim: Color(0xCCFFFFFF),
-    // Fully opaque black, mirroring the white used in dark mode. A softer
-    // near-navy at partial alpha was tried first and read as indistinct
-    // against the basemap -- the controls need a hard edge, not a tint.
-    chromeBorder: Color(0xFF000000),
+    // Mid grey, the mirror of dark's. Black read as a hard outline drawn
+    // around every control; grey still separates them from the map without
+    // announcing itself.
+    //
+    // Opaque for the same reason as dark: an earlier near-navy at partial
+    // alpha read as indistinct against the basemap.
+    chromeBorder: Color(0xFF75808B),
     isDark: false,
     kind: AppThemeKind.light,
   );

@@ -88,6 +88,9 @@ def cmd_prepare(args: argparse.Namespace) -> None:
     if args.rdd2022:
         _remap_rdd(Path(args.rdd2022))
 
+    if args.roboflow:
+        _ingest_roboflow(Path(args.roboflow))
+
     n_train = len(list((DATASET_DIR / "images" / "train").glob("*")))
     n_val = len(list((DATASET_DIR / "images" / "val").glob("*")))
     print(f"train images: {n_train}   val images: {n_val}")
@@ -102,6 +105,132 @@ def cmd_prepare(args: argparse.Namespace) -> None:
             "terrain Uttarakhand data, and a model trained only on it will miss\n"
             "the shaded, gravel-edged damage typical of these roads."
         )
+
+
+def _class_for(name: str) -> str | None:
+    """Maps a dataset's own class name onto ours.
+
+    Deliberately the same loose substring rule the app uses in
+    lib/models/detection.dart, so a dataset whose labels the app would accept
+    is exactly a dataset this will ingest.
+    """
+    s = "".join(ch for ch in name.lower() if ch.isalnum())
+    if "pothole" in s or s == "pot":
+        return "pothole"
+    if "crack" in s or "crazing" in s or "alligator" in s:
+        return "crack"
+    return None
+
+
+def _ingest_roboflow(root: Path) -> None:
+    """Copies in a Roboflow YOLO export, remapping its classes onto ours.
+
+    Expects the layout Roboflow produces for the "YOLOv8" / "YOLO11" format:
+
+        data.yaml
+        train/images  train/labels
+        valid/images  valid/labels
+        test/images   test/labels
+
+    Roboflow's `test` split is folded into val. Holding it back would only
+    matter if we were reporting a headline number on untouched data; for this
+    project the val set is what picks the checkpoint, and more val images make
+    that choice less noisy.
+    """
+    if not root.exists():
+        sys.exit(f"Roboflow export not found: {root}")
+
+    yaml_path = root / "data.yaml"
+    if not yaml_path.exists():
+        sys.exit(f"No data.yaml in {root}. Export from Roboflow in the "
+                 f"'YOLOv8' (or YOLO11) format, not COCO/VOC.")
+
+    # Parsed by hand rather than with PyYAML: `names` is the only field needed
+    # and it arrives as either a flow list or a block mapping. Adding a
+    # dependency for that is not worth it.
+    names: list[str] = []
+    lines = yaml_path.read_text(encoding="utf-8").splitlines()
+
+    for i, raw in enumerate(lines):
+        if not raw.strip().startswith("names:"):
+            continue
+
+        # Flow form:  names: ['pothole', 'crack']
+        rest = raw.strip()[len("names:"):].strip()
+        if rest.startswith("["):
+            names = [n.strip().strip("'\"")
+                     for n in rest.strip("[]").split(",") if n.strip()]
+            break
+
+        # Block form, either  - pothole  or  0: pothole
+        for follow in lines[i + 1:]:
+            s = follow.strip()
+            if not s or not (s.startswith("-") or ":" in s):
+                break
+            if s.startswith("-"):
+                names.append(s[1:].strip().strip("'\""))
+            else:
+                names.append(s.split(":", 1)[1].strip().strip("'\""))
+        break
+
+    if not names:
+        sys.exit(f"Could not read class names from {yaml_path}")
+
+    mapping = {i: _class_for(n) for i, n in enumerate(names)}
+    print(f"roboflow classes: {names}")
+    for i, n in enumerate(names):
+        tgt = mapping[i]
+        print(f"    {i} {n!r} -> {tgt if tgt else 'DROPPED'}")
+    if not any(mapping.values()):
+        sys.exit(
+            "None of this dataset's classes map onto pothole/crack.\n"
+            "Rename them in Roboflow (or extend _class_for) before ingesting."
+        )
+
+    kept = dropped = copied = 0
+    for src_split, dst_split in (("train", "train"),
+                                 ("valid", "val"),
+                                 ("val", "val"),
+                                 ("test", "val")):
+        img_dir = root / src_split / "images"
+        lbl_dir = root / src_split / "labels"
+        if not img_dir.exists() or not lbl_dir.exists():
+            continue
+
+        for img in sorted(img_dir.iterdir()):
+            if img.suffix.lower() not in {".jpg", ".jpeg", ".png"}:
+                continue
+            txt = lbl_dir / f"{img.stem}.txt"
+
+            out_lines = []
+            if txt.exists():
+                for line in txt.read_text(encoding="utf-8").splitlines():
+                    parts = line.split()
+                    if len(parts) < 5:
+                        continue
+                    try:
+                        old = int(parts[0])
+                    except ValueError:
+                        continue
+                    target = mapping.get(old)
+                    if target is None:
+                        dropped += 1
+                        continue
+                    parts[0] = str(CLASSES.index(target))
+                    out_lines.append(" ".join(parts))
+                    kept += 1
+
+            # Prefix the split so two Roboflow exports, or an RDD import and a
+            # Roboflow one, cannot collide on a shared filename.
+            stem = f"rf_{src_split}_{img.stem}"
+            shutil.copy2(img, DATASET_DIR / "images" / dst_split /
+                         f"{stem}{img.suffix.lower()}")
+            (DATASET_DIR / "labels" / dst_split / f"{stem}.txt").write_text(
+                "\n".join(out_lines), encoding="utf-8")
+            copied += 1
+
+    print(f"ingested Roboflow export: {copied} images, "
+          f"{kept} boxes kept, {dropped} dropped")
 
 
 def _remap_rdd(root: Path) -> None:
@@ -284,6 +413,8 @@ def main() -> None:
 
     p = sub.add_parser("prepare", help="create dataset layout + yaml")
     p.add_argument("--rdd2022", help="path to an RDD2022 YOLO export to remap")
+    p.add_argument("--roboflow",
+                   help="path to an unzipped Roboflow YOLOv8/YOLO11 export")
     p.set_defaults(func=cmd_prepare)
 
     p = sub.add_parser("train", help="fine-tune a YOLO nano model")

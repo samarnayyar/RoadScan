@@ -169,13 +169,32 @@ class AppConfig {
   /// Where the camera starts when an area is opened, before it flies in.
   ///
   /// The launch screen's card transition reads as "diving into" the area, and
-  /// the map continues that motion instead of cutting to a static view:
-  /// [areaEntryZoom] is deliberately wide so the first thing shown is the
-  /// corridor in context, which then closes in on the chosen area.
-  static const double areaEntryZoom = 13.0;
+  /// the map continues that motion instead of cutting to a static view.
+  ///
+  /// Set to [minZoom] so the dive starts from the WHOLE corridor -- every area
+  /// and the full operating square visible at once -- rather than from a
+  /// half-way crop. Starting wider makes the descent read as "here is the
+  /// whole patch we cover, now here is your bit of it", which is worth the
+  /// extra second on first open.
+  static const double areaEntryZoom = minZoom;
 
-  /// How long that fly-in takes.
-  static const Duration areaEntryDuration = Duration(milliseconds: 1500);
+  /// How long that fly-in takes. Longer than a normal camera move on purpose:
+  /// it is covering a lot of zoom levels, and at 1.5s it arrived abruptly.
+  static const Duration areaEntryDuration = Duration(milliseconds: 2100);
+
+  /// A deliberate camera move the user asked for -- centring on their
+  /// position, or the initial GPS lock.
+  static const Duration flyToDuration = Duration(milliseconds: 1250);
+
+  /// Snapping the map back to north.
+  ///
+  /// 350ms felt mechanical -- the map just clicked round. Stretching it lets
+  /// the rotation read as the map settling rather than being yanked.
+  static const Duration bearingResetDuration = Duration(milliseconds: 750);
+
+  /// Tilt slider. Kept SHORT, unlike the others: this one tracks a finger, and
+  /// anything slower lags visibly behind the drag.
+  static const Duration pitchDuration = Duration(milliseconds: 220);
   static const double maxZoom = 19.0;
 
   /// Default camera tilt. 45 degrees reads as clearly 3D without the horizon

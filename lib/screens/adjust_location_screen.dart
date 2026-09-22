@@ -92,10 +92,15 @@ class _AdjustLocationScreenState extends State<AdjustLocationScreen> {
             ),
             onMapCreated: (c) => _controller = c,
             onStyleLoadedCallback: () async {
+              // Same bundled footprints as the main map, not the basemap's
+              // own extrusion. This screen is flat and zoomed to ~0.3 m per
+              // pixel, so buildings are the main thing telling the user which
+              // plot they are aiming at -- and the OSM layer here showed the
+              // same handful of stray wedges rather than the real ones.
               try {
-                await MapLayers.addBuildings(_controller!);
+                await MapLayers.addMlBuildings(_controller!, dark: false);
               } catch (_) {
-                /* buildings are cosmetic here */
+                /* buildings are an orientation aid here, not essential */
               }
             },
             onCameraIdle: _onCameraIdle,

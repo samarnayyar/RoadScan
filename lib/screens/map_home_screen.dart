@@ -12,6 +12,7 @@ import '../config/map_layers.dart';
 import '../services/theme_controller.dart';
 import '../models/hazard_report.dart';
 import '../services/location_service.dart';
+import '../services/map_style.dart';
 import '../services/proximity_alerts.dart';
 import '../services/supabase_service.dart';
 import 'package:image_picker/image_picker.dart';
@@ -158,9 +159,44 @@ class _MapHomeScreenState extends State<MapHomeScreen>
   /// Layers must be added after the style loads -- adding them against a
   /// half-initialised style silently no-ops, which looks exactly like a
   /// rendering bug and is a classic way to lose an afternoon.
+  /// Guards against overlapping layer setup.
+  ///
+  /// MapLibre can fire onStyleLoaded more than once per style, and the passes
+  /// then race: the second tries to add layers the first already added
+  /// ("Layer roadscan-pins-glow already exists", which surfaced as an
+  /// unhandled exception) while the first can still be mid-flight against a
+  /// style the platform reports as not ready.
+  bool _layerSetupRunning = false;
+
   Future<void> _onStyleLoaded() async {
     final c = _controller;
     if (c == null) return;
+    if (_layerSetupRunning) return;
+    _layerSetupRunning = true;
+    try {
+      await _installLayers(c);
+    } finally {
+      _layerSetupRunning = false;
+    }
+  }
+
+  Future<void> _installLayers(MapLibreMapController c) async {
+    // Reveal the map FIRST, before adding anything to it.
+    //
+    // This flag gates a full-screen loading panel. Setting it only after every
+    // layer had been added meant any one of them throwing left the panel up
+    // permanently -- a blank screen over a perfectly good map. The basemap is
+    // already drawn by the time this callback runs; everything below is
+    // decoration on top of it, and none of it is worth hiding the map for.
+    if (mounted && !_styleReady) setState(() => _styleReady = true);
+
+    // Water goes down BEFORE the road contrast, so roads cross over the river
+    // rather than the river cutting the network in half at every bridge.
+    try {
+      await MapLayers.addWater(c);
+    } catch (e) {
+      debugPrint('RoadScan: water layers unavailable: $e');
+    }
 
     // Dark basemap only: `liberty` already draws roads with plenty of
     // contrast, but OpenFreeMap's `dark` style makes them nearly invisible.
@@ -176,26 +212,16 @@ class _MapHomeScreenState extends State<MapHomeScreen>
       }
     }
 
-    // Bundled ML footprints, not the tile source's own buildings -- see
-    // MapLayers.addMlBuildings for why. Falls back to the OSM extrusion if
-    // the asset is missing, so a fresh clone without the bake still gets
-    // whatever 3D the basemap can offer.
+    // ...and the corridor AFTER them, because its whole job is to stand out
+    // from the road network it is part of.
     try {
-      await MapLayers.addMlBuildings(
-        c,
-        dark: _builtStyle == AppTheme.mapStyleDark,
-      );
+      await MapLayers.addCorridor(c);
     } catch (e) {
-      debugPrint('RoadScan: bundled buildings unavailable ($e); '
-          'falling back to OSM extrusion');
-      try {
-        await MapLayers.addBuildings(c);
-      } catch (e2) {
-        // A tile source without building heights shouldn't take the map down;
-        // the app is still fully usable in 2D.
-        debugPrint('RoadScan: 3D buildings unavailable: $e2');
-      }
+      debugPrint('RoadScan: corridor layer unavailable: $e');
     }
+
+    // Buildings are NOT added here -- see _ensureBuildings, called at the end
+    // of this method and again whenever the camera settles.
 
     // Everything outside the operating square, hatched off.
     try {
@@ -212,11 +238,19 @@ class _MapHomeScreenState extends State<MapHomeScreen>
       debugPrint('RoadScan: bounds mask unavailable: $e');
     }
 
-    await c.addGeoJsonSource(
-      MapLayers.pinSourceId,
-      MapLayers.pinsGeoJson(const []),
-    );
-    await MapLayers.addPinLayers(c);
+    // Wrapped, and the source is dropped first.
+    //
+    // This was the one unguarded add left in here, and adding a GeoJSON source
+    // that already exists throws. On a repeat style-load that exception
+    // escaped, so the line below that sets _styleReady never ran and the user
+    // was left looking at the loading spinner over a blank map -- a cosmetic
+    // layer failure taking down the whole screen.
+    try {
+      await MapLayers.addPinSource(c);
+      await MapLayers.addPinLayers(c);
+    } catch (e) {
+      debugPrint('RoadScan: pin layers unavailable: $e');
+    }
 
     // Above the hazard pins: where you are is the one thing that must never be
     // occluded, and on a dense stretch a cluster of pins would otherwise bury
@@ -240,7 +274,16 @@ class _MapHomeScreenState extends State<MapHomeScreen>
       debugPrint('RoadScan: user layers unavailable: $e');
     }
 
-    // After the pins, so a hazard marker is never hidden behind a place name.
+    // Place names LAST, so they sit on top of everything.
+    //
+    // These four are the only places the app covers, so knowing which one you
+    // are looking at outranks every other label on the map -- including the
+    // roads and the corridor, which previously drew across the text.
+    //
+    // The 3D buildings would still bury them, because _ensureBuildings adds
+    // those lazily long after this method returns and a plain add lands on
+    // top of the stack. They are anchored below the pin layers instead; see
+    // MapLayers.addMlBuildings.
     try {
       await MapLayers.addAreaLabels(
         c,
@@ -250,20 +293,13 @@ class _MapHomeScreenState extends State<MapHomeScreen>
       debugPrint('RoadScan: area labels unavailable: $e');
     }
 
-    if (!mounted) return;
-    setState(() => _styleReady = true);
-
-    // Apply the tilt explicitly rather than trusting initialCameraPosition.
-    // This is what actually makes the map read as 3D.
-    //
-    // On a theme switch, go back to exactly where the user was instead of the
-    // area centre -- see [_restoreCamera].
     // A re-style keeps the camera, so there is nothing to fly to and the GPS
     // subscription and pin cache are still live. Re-running the first-open
     // path here would replay the fly-in and yank the camera off wherever the
     // user was.
     if (_cameraReady) {
       await _pushPins();
+      await _ensureBuildings();
       return;
     }
 
@@ -287,6 +323,56 @@ class _MapHomeScreenState extends State<MapHomeScreen>
 
     await _startLocation();
     await _refreshPins();
+    // Last: the fly-in has finished by now, so the heavy geometry upload
+    // lands on an idle frame rather than competing with the animation.
+    await _ensureBuildings();
+  }
+
+  /// True once the building extrusion exists in the CURRENT style object.
+  /// Cleared on every style swap, because setStyle discards it.
+  bool _buildingsAdded = false;
+
+  /// Zoom at which the buildings are worth uploading.
+  ///
+  /// Must stay BELOW MapLayers.buildingsMinZoom, or the camera can settle at a
+  /// zoom where the layer would draw but the geometry has not been uploaded
+  /// yet, and the skyline pops in a beat late.
+  ///
+  /// Adding it while the camera is wider than this pushes 3.3 MB of geometry
+  /// across the platform channel for something that will not be drawn -- which
+  /// is most of the cost of a dark <-> light switch, since the map opens at
+  /// minZoom.
+  static const double _buildingsZoomThreshold =
+      MapLayers.buildingsMinZoom - 0.8;
+
+  /// Adds the building extrusion if it is missing and the camera is close
+  /// enough to see it. Safe and cheap to call repeatedly.
+  Future<void> _ensureBuildings() async {
+    if (_buildingsAdded) return;
+    final c = _controller;
+    if (c == null || !_styleReady) return;
+
+    final zoom = c.cameraPosition?.zoom ?? AppConfig.initialZoom;
+    if (zoom < _buildingsZoomThreshold) return;
+
+    // Set before awaiting: onCameraIdle can fire again mid-upload, and a
+    // second pass would add a duplicate layer.
+    _buildingsAdded = true;
+    try {
+      await MapLayers.addMlBuildings(
+        c,
+        dark: _builtStyle == AppTheme.mapStyleDark,
+      );
+    } catch (e) {
+      // No fallback to the basemap's own extrusion, deliberately.
+      //
+      // An empty skyline is better than a wrong one: the OSM alternative is
+      // 151 footprints over 81 km2, 8 of them triangles and none with a real
+      // height, which renders as a handful of stray wedges scattered across
+      // the map. That reads as a rendering fault rather than as data.
+      debugPrint('RoadScan: buildings layer unavailable: $e');
+      _buildingsAdded = false; // let a later camera move retry
+    }
   }
 
   /// Pushes the cached pins into the (possibly new) style's source.
@@ -361,7 +447,7 @@ class _MapHomeScreenState extends State<MapHomeScreen>
           bearing: _bearing,
         ),
       ),
-      duration: const Duration(milliseconds: 900),
+      duration: AppConfig.flyToDuration,
     );
   }
 
@@ -587,7 +673,7 @@ class _MapHomeScreenState extends State<MapHomeScreen>
     setState(() => _pitch = value);
     _controller?.animateCamera(
       CameraUpdate.tiltTo(value),
-      duration: const Duration(milliseconds: 180),
+      duration: AppConfig.pitchDuration,
     );
   }
 
@@ -595,7 +681,7 @@ class _MapHomeScreenState extends State<MapHomeScreen>
     setState(() => _bearing = 0);
     _controller?.animateCamera(
       CameraUpdate.bearingTo(0),
-      duration: const Duration(milliseconds: 350),
+      duration: AppConfig.bearingResetDuration,
     );
   }
 
@@ -627,39 +713,102 @@ class _MapHomeScreenState extends State<MapHomeScreen>
 
 
   /// Applies a theme change to the live map without rebuilding it.
+  ///
+  /// Takes one of two paths, and the distinction matters a lot for how this
+  /// feels on a slower phone:
+  ///
+  ///   SAME basemap (dark <-> neon) -- only the road overlay differs, so
+  ///     nothing is re-styled. setStyle would discard every layer and source
+  ///     and force the 15,121-polygon building source to be re-uploaded to the
+  ///     native side and re-tessellated, which is the stall where the
+  ///     buildings visibly vanish and redraw. Swapping just the road layer
+  ///     avoids all of it.
+  ///
+  ///   DIFFERENT basemap (to or from light) -- the basemap itself has to
+  ///     change, so a full setStyle is unavoidable.
   void _syncStyle(String styleUrl, AppThemeKind kind) {
     if (_builtStyle == null || _builtKind == kind) return;
     if (_styleSwapInFlight) return;
     final c = _controller;
     if (c == null) return;
 
+    final sameBasemap = _builtStyle == styleUrl;
+    _builtKind = kind;
+
+    if (sameBasemap) {
+      // Cheap path: rebuild only the road contrast layer.
+      //
+      // The corridor has to be re-stacked afterwards. A re-added layer goes on
+      // TOP of the style, so rebuilding the roads would bury the corridor
+      // underneath them and the highlight would silently disappear on the
+      // first neon toggle. Re-adding it is cheap -- 388 points against the
+      // 15,121-polygon building source this path exists to protect.
+      _styleSwapInFlight = true;
+      MapLayers.addRoadContrast(c, neon: kind == AppThemeKind.neon)
+          .then((_) => MapLayers.addCorridor(c))
+          .catchError((Object e) =>
+              debugPrint('RoadScan: road overlay swap failed: $e'))
+          .whenComplete(() => _styleSwapInFlight = false);
+      return;
+    }
+
     _styleSwapInFlight = true;
     _builtStyle = styleUrl;
-    _builtKind = kind;
+    // setStyle discards every layer, the buildings included, so the next
+    // _ensureBuildings has to re-add them.
+    _buildingsAdded = false;
 
     // NOTE: _styleReady is deliberately NOT cleared here.
     //
     // It gates the full-screen loading panel, which is correct on first open
     // but wrong for a theme swap: MapLibre keeps rendering the OLD style until
     // the new one is ready, so blanking the screen hides a perfectly good map
-    // behind a spinner and makes a repaint look like a reload. The layers
-    // added in _onStyleLoaded still belong to the old style object and are
-    // discarded with it; the new style's load callback re-adds them either
-    // way.
-    c.setStyle(styleUrl).whenComplete(() => _styleSwapInFlight = false);
+    // behind a spinner and makes a repaint look like a reload.
+    //
+    // MapStyle.resolve hands over the style as JSON with the basemap's own
+    // building layers already removed. Passing the raw URL instead let those
+    // layers render for a frame or two before we could delete them, which is
+    // the blink of stray OSM wedges visible on every switch.
+    MapStyle.resolve(styleUrl)
+        .then((style) => c.setStyle(style))
+        .whenComplete(() => _styleSwapInFlight = false);
   }
+
+  /// The first style, already rewritten by [MapStyle]. Null until the fetch
+  /// completes, during which the map is not built at all -- constructing it
+  /// with the raw URL would show the basemap's own buildings for a moment,
+  /// which is the very flash this avoids.
+  String? _initialStyle;
 
   /// Built exactly once. Theme changes go through [_syncStyle], never through
   /// a rebuild -- see [_builtStyle].
   Widget _buildMap(String styleUrl, AppThemeKind kind) {
     if (_mapWidget != null) return _mapWidget!;
+
+    final resolved = _initialStyle;
+    if (resolved == null) {
+      // Kick off the rewrite; rebuild once it lands.
+      MapStyle.resolve(styleUrl).then((style) {
+        if (!mounted) return;
+        setState(() => _initialStyle = style);
+        // Warm the other basemap so the first theme switch does not pay for
+        // a fetch on top of the swap.
+        final other = styleUrl == AppTheme.mapStyleLight
+            ? AppTheme.mapStyleDark
+            : AppTheme.mapStyleLight;
+        MapStyle.warm(other);
+      });
+      return const SizedBox.expand();
+    }
+
     _builtStyle = styleUrl;
     _builtKind = kind;
 
     return _mapWidget = RepaintBoundary(
       child:
           MapLibreMap(
-            styleString: styleUrl,
+            // The rewritten JSON, not the URL -- see [_initialStyle].
+            styleString: resolved,
             // Opens wide and flat, then flies in to the area (see
             // _onStyleLoaded). Starting at the final zoom would make the
             // launch-screen "dive in" transition stop dead the moment the map
@@ -704,6 +853,10 @@ class _MapHomeScreenState extends State<MapHomeScreen>
             attributionButtonPosition: AttributionButtonPosition.topLeft,
             attributionButtonMargins: const math.Point(12, 74),
             onCameraIdle: () {
+              // Zoomed in far enough to need the buildings? Upload them now.
+              // This is what keeps a theme switch cheap while zoomed out.
+              _ensureBuildings();
+
               // Ignore idle events fired before we positioned the camera.
               if (!_cameraReady) return;
               final cam = _controller?.cameraPosition;

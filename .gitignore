@@ -34,6 +34,7 @@ android/.kotlin/
 # Recreate with: python ml/train_export.py prepare / train
 ml/dataset/
 ml/runs/
+photos/
 *.pt
 *.onnx
 __pycache__/
