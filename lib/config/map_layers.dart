@@ -61,20 +61,61 @@ class MapLayers {
   ///
   /// Light mode does not need this -- `liberty` already has strong road
   /// contrast -- so the map screen only adds it for the dark theme.
-  static Future<void> addRoadContrast(MapLibreMapController c) async {
+  static Future<void> addRoadContrast(
+    MapLibreMapController c, {
+    bool neon = false,
+  }) async {
+    // Neon carries the launch screen's glowing-network look onto the map: a
+    // wide, low-opacity halo under a bright core, same idea as the area cards.
+    if (neon) {
+      await c.addLineLayer(
+        _vectorSourceId,
+        '$roadsLayerId-glow',
+        LineLayerProperties(
+          lineColor: '#3FE0FF',
+          lineWidth: [
+            'interpolate',
+            ['exponential', 1.5],
+            ['zoom'],
+            10, 2.0,
+            14, 6.0,
+            16, 11.0,
+            19, 30.0,
+          ],
+          lineOpacity: 0.16,
+          lineBlur: 6.0,
+          lineCap: 'round',
+          lineJoin: 'round',
+        ),
+        sourceLayer: _transportSourceLayer,
+        filter: ['!in', ['get', 'class'], 'path', 'footway', 'steps'],
+        enableInteraction: false,
+      );
+    }
+
     await c.addLineLayer(
       _vectorSourceId,
       roadsLayerId,
       LineLayerProperties(
-        lineColor: [
-          'match',
-          ['get', 'class'],
-          'motorway', '#7FB2D9',
-          'trunk', '#7FB2D9',
-          'primary', '#6E9CC4',
-          'secondary', '#5D86AB',
-          '#4A6B88', // everything else: residential, service, track
-        ],
+        lineColor: neon
+            ? [
+                'match',
+                ['get', 'class'],
+                'motorway', '#B8F4FF',
+                'trunk', '#B8F4FF',
+                'primary', '#8CEBFF',
+                'secondary', '#5FE2FF',
+                '#3FD4F5',
+              ]
+            : [
+                'match',
+                ['get', 'class'],
+                'motorway', '#7FB2D9',
+                'trunk', '#7FB2D9',
+                'primary', '#6E9CC4',
+                'secondary', '#5D86AB',
+                '#4A6B88', // everything else: residential, service, track
+              ],
         lineWidth: [
           'interpolate',
           ['exponential', 1.5],
@@ -84,7 +125,7 @@ class MapLayers {
           16, 2.6,
           19, 8.0,
         ],
-        lineOpacity: 0.85,
+        lineOpacity: neon ? 0.95 : 0.85,
         lineCap: 'round',
         lineJoin: 'round',
       ),
@@ -142,6 +183,22 @@ class MapLayers {
   // Building footprints
   // ---------------------------------------------------------------------------
 
+  /// Parsed once and kept for the life of the process.
+  ///
+  /// This asset is 3.2 MB of JSON covering 15,121 polygons, and every theme
+  /// switch re-runs the whole style setup. Re-reading and re-decoding it on
+  /// each swap was a visible stall -- the decode alone blocks the UI isolate.
+  /// Holding the parsed map costs a few MB of heap and makes the second and
+  /// subsequent swaps essentially free.
+  static Map<String, dynamic>? _buildingsCache;
+
+  static Future<Map<String, dynamic>> _buildingsGeoJson() async {
+    final cached = _buildingsCache;
+    if (cached != null) return cached;
+    final raw = await rootBundle.loadString('assets/buildings.geojson');
+    return _buildingsCache = json.decode(raw) as Map<String, dynamic>;
+  }
+
   /// Extrudes the bundled Microsoft ML footprints.
   ///
   /// This is what makes the corridor look inhabited. OSM has 151 buildings
@@ -179,11 +236,7 @@ class MapLayers {
       }
     }
 
-    final raw = await rootBundle.loadString('assets/buildings.geojson');
-    await c.addGeoJsonSource(
-      mlBuildingsSourceId,
-      json.decode(raw) as Map<String, dynamic>,
-    );
+    await c.addGeoJsonSource(mlBuildingsSourceId, await _buildingsGeoJson());
 
     await c.addFillExtrusionLayer(
       mlBuildingsSourceId,
@@ -592,7 +645,10 @@ class MapLayers {
   /// Generated at runtime rather than shipped as an asset: it is twelve lines
   /// of drawing code, scales to whatever DPR the device has, and avoids
   /// another binary in the repo.
+  static Uint8List? _hatchCache;
+
   static Future<Uint8List?> makeHatchImage({int size = 16}) async {
+    if (_hatchCache != null) return _hatchCache;
     try {
       final recorder = ui.PictureRecorder();
       final canvas = Canvas(recorder);
@@ -611,7 +667,7 @@ class MapLayers {
       final image = await recorder.endRecording().toImage(size, size);
       final data = await image.toByteData(format: ui.ImageByteFormat.png);
       image.dispose();
-      return data?.buffer.asUint8List();
+      return _hatchCache = data?.buffer.asUint8List();
     } catch (e) {
       // A missing pattern is cosmetic -- the flat fill still masks the area.
       debugPrint('RoadScan: hatch pattern unavailable: $e');

@@ -101,13 +101,21 @@ class AppDrawer extends StatelessWidget {
             // Same three-state cycle as the launch screen's toggle, surfaced
             // here too because the map is where users spend their time and
             // where switching theme actually matters (day vs night riding).
-            ValueListenableBuilder<ThemeMode>(
-              valueListenable: ThemeController.instance.mode,
-              builder: (context, mode, _) => _Item(
-                icon: ThemeController.icon(mode),
+            ValueListenableBuilder<AppThemeKind>(
+              valueListenable: ThemeController.instance.kind,
+              builder: (context, kind, _) => _Item(
+                icon: kind.icon,
                 title: 'Theme',
-                subtitle: ThemeController.label(mode),
-                onTap: () => ThemeController.instance.cycle(),
+                // Cycles all three here. The map and launch screens split it
+                // into two buttons because they have the room; a drawer row
+                // does not, and one row that steps through every option is
+                // clearer there than two stacked toggles.
+                subtitle: '${kind.label} - tap to change',
+                onTap: () => ThemeController.instance.set(switch (kind) {
+                  AppThemeKind.dark => AppThemeKind.light,
+                  AppThemeKind.light => AppThemeKind.neon,
+                  AppThemeKind.neon => AppThemeKind.dark,
+                }),
                 showChevron: false,
               ),
             ),

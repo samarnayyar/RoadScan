@@ -1,81 +1,95 @@
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+/// The three looks RoadScan ships.
+///
+/// Not Flutter's [ThemeMode]: that only knows light/dark/system, and `neon` is
+/// a third distinct presentation rather than a brightness. It shares dark's
+/// brightness but changes what the area cards draw (vector road networks that
+/// glow, instead of raster map thumbnails) and how the map's road overlay is
+/// coloured.
+enum AppThemeKind {
+  dark,
+  light,
+  neon;
+
+  String get wire => name;
+
+  /// Dark and neon are both dark-brightness; only `light` is not.
+  bool get isDark => this != AppThemeKind.light;
+
+  String get label => switch (this) {
+        AppThemeKind.dark => 'Dark',
+        AppThemeKind.light => 'Light',
+        AppThemeKind.neon => 'Neon',
+      };
+
+  IconData get icon => switch (this) {
+        AppThemeKind.dark => Icons.dark_mode_outlined,
+        AppThemeKind.light => Icons.light_mode_outlined,
+        AppThemeKind.neon => Icons.auto_awesome_outlined,
+      };
+
+  static AppThemeKind fromWire(String? s) => switch (s) {
+        'light' => AppThemeKind.light,
+        'neon' => AppThemeKind.neon,
+        // Anything else -- 'dark', a stale 'system' from an older build, or a
+        // corrupt value -- lands on dark, which is the default.
+        _ => AppThemeKind.dark,
+      };
+}
+
 /// Holds the chosen theme and remembers it across launches.
 ///
 /// A ValueNotifier rather than a state-management package: the app has exactly
 /// one piece of global UI state, and adding Provider/Riverpod for it would be
-/// more framework than the problem deserves. MaterialApp rebuilds on change
-/// via a ValueListenableBuilder in main.dart.
+/// more framework than the problem deserves.
 ///
-/// Defaults to [ThemeMode.system] rather than forcing dark. The app is used
-/// outdoors in daylight as often as at night, and the phone already knows
-/// which the user prefers -- overriding that on first launch would be
-/// presumptuous.
+/// Starts on [AppThemeKind.dark] -- the app's own identity is dark, and it is
+/// the look the map was designed against.
 class ThemeController {
   ThemeController._();
   static final ThemeController instance = ThemeController._();
 
   static const _key = 'roadscan.theme_mode';
 
-  final ValueNotifier<ThemeMode> mode = ValueNotifier(ThemeMode.system);
+  final ValueNotifier<AppThemeKind> kind =
+      ValueNotifier(AppThemeKind.dark);
+
+  AppThemeKind get value => kind.value;
 
   /// Reads the saved preference. Failure is non-fatal: a missing or corrupt
-  /// preference should start the app on the system theme, never block launch.
+  /// preference should start the app on the default, never block launch.
   Future<void> load() async {
     try {
       final prefs = await SharedPreferences.getInstance();
-      mode.value = _fromWire(prefs.getString(_key));
+      kind.value = AppThemeKind.fromWire(prefs.getString(_key));
     } catch (e) {
       debugPrint('RoadScan: could not read theme preference: $e');
     }
   }
 
-  Future<void> set(ThemeMode value) async {
-    mode.value = value;
+  Future<void> set(AppThemeKind value) async {
+    kind.value = value;
     try {
       final prefs = await SharedPreferences.getInstance();
-      await prefs.setString(_key, value.name);
+      await prefs.setString(_key, value.wire);
     } catch (e) {
       // The theme still changed for this session; it just will not persist.
       debugPrint('RoadScan: could not save theme preference: $e');
     }
   }
 
-  /// Cycles system -> light -> dark -> system, which is what a single
-  /// tappable control in the drawer needs.
-  Future<void> cycle() => set(switch (mode.value) {
-        ThemeMode.system => ThemeMode.light,
-        ThemeMode.light => ThemeMode.dark,
-        ThemeMode.dark => ThemeMode.system,
-      });
+  /// Dark <-> light. Neon is deliberately NOT in this rotation -- it has its
+  /// own control, so switching day/night never lands you somewhere unexpected.
+  Future<void> toggleBrightness() => set(
+        value == AppThemeKind.light ? AppThemeKind.dark : AppThemeKind.light,
+      );
 
-  /// Whether dark colours are in effect right now, resolving
-  /// [ThemeMode.system] against the platform. Widgets that need to pick an
-  /// asset (the area cards pick a dark or light map thumbnail) need the
-  /// resolved answer, not the mode.
-  static bool isDark(BuildContext context, ThemeMode mode) => switch (mode) {
-        ThemeMode.dark => true,
-        ThemeMode.light => false,
-        ThemeMode.system =>
-          MediaQuery.platformBrightnessOf(context) == Brightness.dark,
-      };
+  /// Turns neon on, or back to dark if it is already on.
+  Future<void> toggleNeon() => set(
+        value == AppThemeKind.neon ? AppThemeKind.dark : AppThemeKind.neon,
+      );
 
-  static ThemeMode _fromWire(String? s) => switch (s) {
-        'light' => ThemeMode.light,
-        'dark' => ThemeMode.dark,
-        _ => ThemeMode.system,
-      };
-
-  static String label(ThemeMode m) => switch (m) {
-        ThemeMode.system => 'Match device',
-        ThemeMode.light => 'Light',
-        ThemeMode.dark => 'Dark',
-      };
-
-  static IconData icon(ThemeMode m) => switch (m) {
-        ThemeMode.system => Icons.brightness_auto_outlined,
-        ThemeMode.light => Icons.light_mode_outlined,
-        ThemeMode.dark => Icons.dark_mode_outlined,
-      };
+  bool get isNeon => value == AppThemeKind.neon;
 }

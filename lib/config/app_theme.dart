@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 
+import '../services/theme_controller.dart' show AppThemeKind;
+
 /// RoadScan's semantic colours.
 ///
 /// The app uses far more colours than Material's ColorScheme names sensibly
@@ -29,6 +31,7 @@ class RoadScanColors extends ThemeExtension<RoadScanColors> {
     required this.scrim,
     required this.chromeBorder,
     required this.isDark,
+    required this.kind,
   });
 
   /// Page background.
@@ -70,21 +73,63 @@ class RoadScanColors extends ThemeExtension<RoadScanColors> {
   /// Lets widgets branch on brightness without reaching for Theme.of again.
   final bool isDark;
 
+  /// Which of the three looks is active.
+  ///
+  /// Needed beyond [isDark] because neon and dark share a brightness but
+  /// render the area cards completely differently -- neon draws vector road
+  /// networks that glow, the other two show raster map thumbnails.
+  final AppThemeKind kind;
+
+  bool get isNeon => kind == AppThemeKind.neon;
+
   static const RoadScanColors dark = RoadScanColors(
-    background: Color(0xFF0E1A26),
-    backgroundDeep: Color(0xFF070F18),
-    surface: Color(0xFF16293A),
-    surfaceAlt: Color(0xFF12222F),
-    border: Color(0xFF22394D),
+    // Near-neutral charcoal with only a trace of blue. The previous values
+    // were a saturated navy, which is what made the launch screen read as a
+    // blue gradient wallpaper rather than as an instrument panel.
+    background: Color(0xFF14171A),
+    backgroundDeep: Color(0xFF0B0D0F),
+    surface: Color(0xFF1E2327),
+    surfaceAlt: Color(0xFF191D21),
+    border: Color(0xFF2E353B),
     textPrimary: Color(0xFFFFFFFF),
-    textSecondary: Color(0xFF8FA3B5),
-    textMuted: Color(0xFF5E7386),
+    textSecondary: Color(0xFF9AA5AD),
+    textMuted: Color(0xFF6B757D),
     accent: Color(0xFF2E9CD6),
     accentSoft: Color(0x332E9CD6),
     scrim: Color(0xD8091521),
-    // White hairline over a dark basemap.
-    chromeBorder: Color(0x4DFFFFFF),
+    // Fully opaque white. A translucent hairline picked up whatever was under
+    // it and read as muddy rather than as a defined edge.
+    chromeBorder: Color(0xFFFFFFFF),
     isDark: true,
+    kind: AppThemeKind.dark,
+  );
+
+  /// Neon: dark's structure, pushed further.
+  ///
+  /// Blacker ground and a brighter, more saturated accent, because everything
+  /// this theme draws is meant to look self-lit against it. Sharing dark's
+  /// layout values keeps the switch a repaint rather than a relayout.
+  static const RoadScanColors neon = RoadScanColors(
+    // True OLED black. On this phone's panel a #000 pixel is physically off,
+    // so the glow has nothing behind it to wash against and the colour reads
+    // at full strength -- which is the entire point of this theme. It also
+    // costs less battery than the near-blacks the other themes use.
+    background: Color(0xFF000000),
+    backgroundDeep: Color(0xFF000000),
+    // Surfaces stay very dark too, so panels do not appear as grey rectangles
+    // floating on a black field.
+    surface: Color(0xFF0A0D11),
+    surfaceAlt: Color(0xFF05070A),
+    border: Color(0xFF1D2630),
+    textPrimary: Color(0xFFFFFFFF),
+    textSecondary: Color(0xFF9FB4C4),
+    textMuted: Color(0xFF6A8090),
+    accent: Color(0xFF3FE0FF),
+    accentSoft: Color(0x333FE0FF),
+    scrim: Color(0xE0040608),
+    chromeBorder: Color(0xFF3FE0FF),
+    isDark: true,
+    kind: AppThemeKind.neon,
   );
 
   static const RoadScanColors light = RoadScanColors(
@@ -102,11 +147,12 @@ class RoadScanColors extends ThemeExtension<RoadScanColors> {
     accent: Color(0xFF1B6CA8),
     accentSoft: Color(0x261B6CA8),
     scrim: Color(0xCCFFFFFF),
-    // Dark hairline over a pale basemap. Not pure black: at this alpha a
-    // neutral black hairline looks dirty against the map's warm paper tone,
-    // so this is the theme's own near-navy instead.
-    chromeBorder: Color(0x590E1A26),
+    // Fully opaque black, mirroring the white used in dark mode. A softer
+    // near-navy at partial alpha was tried first and read as indistinct
+    // against the basemap -- the controls need a hard edge, not a tint.
+    chromeBorder: Color(0xFF000000),
     isDark: false,
+    kind: AppThemeKind.light,
   );
 
   @override
@@ -124,6 +170,7 @@ class RoadScanColors extends ThemeExtension<RoadScanColors> {
     Color? scrim,
     Color? chromeBorder,
     bool? isDark,
+    AppThemeKind? kind,
   }) {
     return RoadScanColors(
       background: background ?? this.background,
@@ -139,6 +186,7 @@ class RoadScanColors extends ThemeExtension<RoadScanColors> {
       scrim: scrim ?? this.scrim,
       chromeBorder: chromeBorder ?? this.chromeBorder,
       isDark: isDark ?? this.isDark,
+      kind: kind ?? this.kind,
     );
   }
 
@@ -158,9 +206,10 @@ class RoadScanColors extends ThemeExtension<RoadScanColors> {
       accentSoft: Color.lerp(accentSoft, other.accentSoft, t)!,
       scrim: Color.lerp(scrim, other.scrim, t)!,
       chromeBorder: Color.lerp(chromeBorder, other.chromeBorder, t)!,
-      // A half-faded theme still has to answer this; snap at the midpoint
-      // rather than pretending it is meaningfully interpolable.
+      // A half-faded theme still has to answer these; snap at the midpoint
+      // rather than pretending they are meaningfully interpolable.
       isDark: t < 0.5 ? isDark : other.isDark,
+      kind: t < 0.5 ? kind : other.kind,
     );
   }
 }
@@ -238,4 +287,19 @@ class AppTheme {
 
   static ThemeData get dark => build(RoadScanColors.dark);
   static ThemeData get light => build(RoadScanColors.light);
+  static ThemeData get neon => build(RoadScanColors.neon);
+
+  static RoadScanColors colorsFor(AppThemeKind kind) => switch (kind) {
+        AppThemeKind.dark => RoadScanColors.dark,
+        AppThemeKind.light => RoadScanColors.light,
+        AppThemeKind.neon => RoadScanColors.neon,
+      };
+
+  static ThemeData themeFor(AppThemeKind kind) => build(colorsFor(kind));
+
+  /// Basemap style per theme. Neon rides on the same near-black basemap as
+  /// dark; what makes it neon is the road overlay drawn on top of it (see
+  /// MapLayers.addRoadContrast).
+  static String mapStyleFor(AppThemeKind kind) =>
+      kind == AppThemeKind.light ? mapStyleLight : mapStyleDark;
 }

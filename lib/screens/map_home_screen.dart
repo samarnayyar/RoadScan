@@ -91,6 +91,14 @@ class _MapHomeScreenState extends State<MapHomeScreen>
   /// the surface and the camera, so only the style itself is refetched.
   String? _builtStyle;
 
+  /// The theme the live layers were built for.
+  ///
+  /// Tracked separately from [_builtStyle] because dark and neon share the
+  /// same basemap URL -- what differs is the road overlay drawn on top. Keying
+  /// the swap on the style alone meant switching dark <-> neon changed
+  /// nothing on the map at all.
+  AppThemeKind? _builtKind;
+
   /// Guards against firing setStyle repeatedly while one is already in flight
   /// (build can run several times before the new style finishes loading).
   bool _styleSwapInFlight = false;
@@ -159,7 +167,10 @@ class _MapHomeScreenState extends State<MapHomeScreen>
     // See MapLayers.addRoadContrast.
     if (_builtStyle == AppTheme.mapStyleDark) {
       try {
-        await MapLayers.addRoadContrast(c);
+        await MapLayers.addRoadContrast(
+          c,
+          neon: ThemeController.instance.isNeon,
+        );
       } catch (e) {
         debugPrint('RoadScan: road contrast layer unavailable: $e');
       }
@@ -616,25 +627,34 @@ class _MapHomeScreenState extends State<MapHomeScreen>
 
 
   /// Applies a theme change to the live map without rebuilding it.
-  void _syncStyle(String styleUrl) {
-    if (_builtStyle == null || _builtStyle == styleUrl) return;
+  void _syncStyle(String styleUrl, AppThemeKind kind) {
+    if (_builtStyle == null || _builtKind == kind) return;
     if (_styleSwapInFlight) return;
     final c = _controller;
     if (c == null) return;
 
     _styleSwapInFlight = true;
     _builtStyle = styleUrl;
-    // The layers added in _onStyleLoaded belong to the OLD style object and
-    // are discarded with it; the new style's load callback re-adds them.
-    _styleReady = false;
+    _builtKind = kind;
+
+    // NOTE: _styleReady is deliberately NOT cleared here.
+    //
+    // It gates the full-screen loading panel, which is correct on first open
+    // but wrong for a theme swap: MapLibre keeps rendering the OLD style until
+    // the new one is ready, so blanking the screen hides a perfectly good map
+    // behind a spinner and makes a repaint look like a reload. The layers
+    // added in _onStyleLoaded still belong to the old style object and are
+    // discarded with it; the new style's load callback re-adds them either
+    // way.
     c.setStyle(styleUrl).whenComplete(() => _styleSwapInFlight = false);
   }
 
   /// Built exactly once. Theme changes go through [_syncStyle], never through
   /// a rebuild -- see [_builtStyle].
-  Widget _buildMap(String styleUrl) {
+  Widget _buildMap(String styleUrl, AppThemeKind kind) {
     if (_mapWidget != null) return _mapWidget!;
     _builtStyle = styleUrl;
+    _builtKind = kind;
 
     return _mapWidget = RepaintBoundary(
       child:
@@ -708,32 +728,30 @@ class _MapHomeScreenState extends State<MapHomeScreen>
   Widget build(BuildContext context) {
     final c = context.rs;
 
-    return ValueListenableBuilder<ThemeMode>(
-      valueListenable: ThemeController.instance.mode,
-      builder: (context, mode, _) {
-        final dark = ThemeController.isDark(context, mode);
-        final styleUrl =
-            dark ? AppTheme.mapStyleDark : AppTheme.mapStyleLight;
+    return ValueListenableBuilder<AppThemeKind>(
+      valueListenable: ThemeController.instance.kind,
+      builder: (context, kind, _) {
+        final styleUrl = AppTheme.mapStyleFor(kind);
         // Swap the basemap after this frame: setStyle talks to the platform
         // channel, and calling it during build would mutate the map while it
         // is being laid out.
-        if (_builtStyle != null && _builtStyle != styleUrl) {
+        if (_builtKind != null && _builtKind != kind) {
           WidgetsBinding.instance
-              .addPostFrameCallback((_) => _syncStyle(styleUrl));
+              .addPostFrameCallback((_) => _syncStyle(styleUrl, kind));
         }
-        return _buildScaffold(context, c, styleUrl);
+        return _buildScaffold(context, c, styleUrl, kind);
       },
     );
   }
 
-  Widget _buildScaffold(
-      BuildContext context, RoadScanColors c, String styleUrl) {
+  Widget _buildScaffold(BuildContext context, RoadScanColors c,
+      String styleUrl, AppThemeKind kind) {
     return Scaffold(
       key: _scaffoldKey,
       drawer: AppDrawer(deviceId: _deviceId.isEmpty ? '00000000' : _deviceId),
       body: Stack(
         children: [
-          _buildMap(styleUrl),
+          _buildMap(styleUrl, kind),
 
           if (!_styleReady)
             ColoredBox(
@@ -823,13 +841,35 @@ class _MapHomeScreenState extends State<MapHomeScreen>
                       Column(
                         mainAxisSize: MainAxisSize.min,
                         children: [
-                          ValueListenableBuilder<ThemeMode>(
-                            valueListenable: ThemeController.instance.mode,
-                            builder: (context, m, _) => _MapGlassButton(
-                              icon: ThemeController.icon(m),
-                              tooltip: 'Theme: ${ThemeController.label(m)}',
-                              onTap: () => ThemeController.instance.cycle(),
+                          // Neon, with the same lit-when-active treatment as
+                          // the launch screen so the control means the same
+                          // thing in both places.
+                          ValueListenableBuilder<AppThemeKind>(
+                            valueListenable: ThemeController.instance.kind,
+                            builder: (context, k, _) => _MapGlassButton(
+                              icon: Icons.auto_awesome_outlined,
+                              tooltip: k == AppThemeKind.neon
+                                  ? 'Neon on'
+                                  : 'Neon',
+                              active: k == AppThemeKind.neon,
+                              onTap: () =>
+                                  ThemeController.instance.toggleNeon(),
                             ),
+                          ),
+                          const SizedBox(height: 8),
+                          ValueListenableBuilder<AppThemeKind>(
+                            valueListenable: ThemeController.instance.kind,
+                            builder: (context, k, _) {
+                              final target = k == AppThemeKind.light
+                                  ? AppThemeKind.dark
+                                  : AppThemeKind.light;
+                              return _MapGlassButton(
+                                icon: target.icon,
+                                tooltip: 'Switch to ${target.label}',
+                                onTap: () => ThemeController.instance
+                                    .toggleBrightness(),
+                              );
+                            },
                           ),
                           const SizedBox(height: 8),
                           // Reset bearing to north. The needle rotates with
@@ -886,6 +926,7 @@ class _MapGlassButton extends StatelessWidget {
     required this.tooltip,
     required this.onTap,
     this.iconRotation,
+    this.active = false,
   });
 
   final IconData icon;
@@ -894,6 +935,9 @@ class _MapGlassButton extends StatelessWidget {
 
   /// Radians. Used by the compass so its needle tracks the map's bearing.
   final double? iconRotation;
+
+  /// Lit state, for controls that are on/off rather than momentary.
+  final bool active;
 
   @override
   Widget build(BuildContext context) {
@@ -906,9 +950,14 @@ class _MapGlassButton extends StatelessWidget {
         child: BackdropFilter(
           filter: ui.ImageFilter.blur(sigmaX: 18, sigmaY: 18),
           child: Material(
-            color: glass.withValues(alpha: c.isDark ? 0.55 : 0.62),
+            color: active
+                ? c.accent.withValues(alpha: 0.22)
+                : glass.withValues(alpha: c.isDark ? 0.55 : 0.62),
             shape: CircleBorder(
-              side: BorderSide(color: c.chromeBorder, width: 1.0),
+              side: BorderSide(
+                color: active ? c.accent : c.chromeBorder,
+                width: active ? 1.6 : 1.0,
+              ),
             ),
             child: InkWell(
               customBorder: const CircleBorder(),
@@ -916,7 +965,9 @@ class _MapGlassButton extends StatelessWidget {
               child: Padding(
                 padding: const EdgeInsets.all(10),
                 child: iconRotation == null
-                    ? Icon(icon, size: 19, color: c.textPrimary)
+                    ? Icon(icon,
+                        size: 19,
+                        color: active ? c.accent : c.textPrimary)
                     : Transform.rotate(
                         angle: iconRotation!,
                         child: Icon(icon, size: 19, color: c.textPrimary),

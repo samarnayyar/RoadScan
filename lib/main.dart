@@ -37,15 +37,16 @@ class RoadScanApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return ValueListenableBuilder<ThemeMode>(
-      valueListenable: ThemeController.instance.mode,
-      builder: (context, mode, _) {
+    return ValueListenableBuilder<AppThemeKind>(
+      valueListenable: ThemeController.instance.kind,
+      builder: (context, kind, _) {
+        // One explicit theme rather than light/dark/themeMode: `neon` is a
+        // third look, not a brightness, so MaterialApp's two-slot scheme
+        // cannot express it.
         return MaterialApp(
           title: 'RoadScan',
           debugShowCheckedModeBanner: false,
-          theme: AppTheme.light,
-          darkTheme: AppTheme.dark,
-          themeMode: mode,
+          theme: AppTheme.themeFor(kind),
           home: const AreaSelectScreen(),
         );
       },

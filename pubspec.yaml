@@ -68,6 +68,11 @@ flutter:
     # variants so the cards follow the app theme.
     # (c) OpenStreetMap contributors -- credited in the launch screen caption.
     - assets/area_maps/
+    # Vector road geometry per area, baked by tool/fetch_area_roads.py. Used
+    # instead of the raster thumbnails so the cards can recolour roads per
+    # theme -- bright in dark mode, near-black in light.
+    # (c) OpenStreetMap contributors, ODbL.
+    - assets/area_roads.json
     # 15,121 building footprints for the corridor, baked by
     # tool/fetch_buildings.py from Microsoft's Global ML Building Footprints.
     # OSM has only 151 buildings here, which is why the 3D map looked

@@ -123,12 +123,19 @@ def to_dark(img: Image.Image) -> Image.Image:
 
 
 def to_light(img: Image.Image) -> Image.Image:
-    """Slightly desaturated and lifted, so the card reads as a calm backdrop
-    rather than competing with the label on top of it."""
+    """Near-original, with a touch more contrast.
+
+    An earlier version desaturated to 55% and lifted brightness, on the theory
+    that the map should recede behind the label. In practice the card ALSO
+    applies an accent wash and a scrim, so the thumbnail was being washed three
+    times over -- the result was pale grey-green mush with sickly-looking
+    forest areas. The card-side overlays were reduced instead, and the map is
+    now left close to how OSM draws it.
+    """
     from PIL import ImageEnhance
 
-    img = ImageEnhance.Color(img).enhance(0.55)
-    return ImageEnhance.Brightness(img).enhance(1.06)
+    img = ImageEnhance.Color(img).enhance(0.92)
+    return ImageEnhance.Contrast(img).enhance(1.08)
 
 
 def build(area_id: str, lat: float, lon: float) -> None:
