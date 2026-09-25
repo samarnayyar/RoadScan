@@ -40,7 +40,7 @@ except ImportError:  # pragma: no cover
     raise SystemExit(1)
 
 ROOT = Path(__file__).resolve().parent.parent
-SRC = ROOT / "logo-nobg.png"
+SRC = ROOT / "outside-logo.jpeg"
 WORDMARK_SRC = ROOT / "roadscan-nobg.png"
 
 # The wordmark ships as white "ROAD" + green "SCAN" on transparency, which is
@@ -70,47 +70,93 @@ BACKGROUND = (247, 245, 240)
 
 
 def load_trimmed() -> Image.Image:
-    """The artwork cropped to the tyre, with the paper background removed.
+    """The app icon, lifted out of the supplied screenshot.
 
-    The background is knocked out by flood-filling inward from the corners,
-    NOT by matching the background colour everywhere. The difference matters:
-    the lane markings, the tyre's inner ring and the sun are all near-white
-    too, and a global colour match punches holes straight through them. A
-    flood only removes background that is actually connected to the edge.
+    The source is a phone screenshot of the artwork in a gallery viewer, not
+    a bare image: a status bar and a Share bar top and bottom, black
+    letterboxing around a white band, and the icon sitting inside that band.
+    Feeding it to the resizers whole would produce a launcher icon that is
+    mostly black letterbox with a tiny logo in the middle.
+
+    So: find the white band first (the viewer's page background), then take
+    the bounding box of everything inside it that is not that white. That
+    lands exactly on the rounded-square icon regardless of where in the
+    screenshot it sits or how tall the system bars are.
     """
-    im = Image.open(SRC).convert("RGBA")
-
-    # Work at a reduced size: the largest output is the 432px adaptive
-    # foreground, so 1400px is already oversampled, and the flood fill is
-    # pure-Python and scales with pixel count.
+    im = Image.open(SRC).convert("RGB")
     im.thumbnail((1400, 1400), Image.LANCZOS)
     w, h = im.size
+    px = im.load()
 
-    # Only knock out the background when there is one. A source that already
-    # carries alpha (logo-nobg.png) is left alone -- flood-filling it would
-    # start from an already-transparent corner and eat into the artwork.
-    if im.split()[-1].getextrema()[0] == 255:
-        print("    opaque source; flood-filling the background")
-        for seed in ((0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)):
-            ImageDraw.floodfill(im, seed, (0, 0, 0, 0), thresh=42)
-    else:
-        print("    source already has alpha; using it as-is")
+    def near_white(p):
+        return p[0] > 225 and p[1] > 225 and p[2] > 225
 
-    box = im.getbbox()
-    if box is None:
-        raise SystemExit("could not find the mark against the background")
+    # Rows belonging to the viewer's white page, sampled across the width.
+    band = [y for y in range(h)
+            if sum(near_white(px[x, y]) for x in range(0, w, 8))
+            > (w // 8) * 0.55]
+    if not band:
+        raise SystemExit(
+            "no white page found in the screenshot -- if the source is "
+            "already a bare image, crop it by hand and re-run.")
+    top, bottom = min(band), max(band)
 
-    pad = int(max(box[2] - box[0], box[3] - box[1]) * 0.02)
-    box = (max(0, box[0] - pad), max(0, box[1] - pad),
-           min(w, box[2] + pad), min(h, box[3] + pad))
-    cropped = im.crop(box)
+    # Inside the band, find the icon BODY -- the dark pixels -- not merely
+    # everything that is not the page.
+    #
+    # "Not white" also matches the soft drop shadow the viewer paints around
+    # the icon, and that shadow extends well past the artwork. Cropping to it
+    # left a white frame baked into every launcher icon. The body is a near
+    # black rounded square, so thresholding on darkness lands on the artwork
+    # itself and the shadow falls outside.
+    def is_body(p):
+        return max(p) < 110
+
+    minx, miny, maxx, maxy = w, bottom, 0, top
+    for y in range(top, bottom + 1):
+        for x in range(0, w, 2):
+            if is_body(px[x, y]):
+                minx = min(minx, x)
+                maxx = max(maxx, x)
+                miny = min(miny, y)
+                maxy = max(maxy, y)
+    if minx >= maxx or miny >= maxy:
+        raise SystemExit(
+            "found the page but no dark artwork inside it -- if this logo is "
+            "light on a dark ground, invert the is_body test.")
+
+    cropped = im.crop((minx, miny, maxx + 1, maxy + 1))
+
+    # Fill the four corner wedges left by the artwork's rounded corners.
+    #
+    # A rounded square's bounding box necessarily includes page-white at each
+    # corner, which came through as a white frame around every launcher icon.
+    # Flooding inward from the corners with the icon's own background colour
+    # closes them; the white ROADSCAN lettering inside the icon is not
+    # connected to any corner, so it is untouched.
+    corner = im.getpixel(((minx + maxx) // 2, miny + 3))
+    cw, ch = cropped.size
+    for seed in ((0, 0), (cw - 1, 0), (0, ch - 1), (cw - 1, ch - 1)):
+        ImageDraw.floodfill(cropped, seed, corner, thresh=60)
+
+    cropped = cropped.convert("RGBA")
 
     # Square it by padding the short axis, so no later resize distorts it.
+    # Padded with the artwork's own background colour rather than
+    # transparency: this icon is a filled rounded square, so transparent
+    # padding would show as notches along whichever edge was short.
+    #
+    # Sampled from the middle of the TOP EDGE, not from a corner. The artwork
+    # has rounded corners, so the corner pixel of its bounding box is still
+    # page-white -- sampling there gave a white plate behind a black icon.
+    fill = corner + (255,)
     side = max(cropped.size)
-    square = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+    square = Image.new("RGBA", (side, side), fill)
     square.paste(cropped,
-                 ((side - cropped.width) // 2, (side - cropped.height) // 2))
-    print(f"    cropped {im.size} -> {cropped.size}, squared to {side}px")
+                 ((side - cropped.width) // 2, (side - cropped.height) // 2),
+                 cropped)
+    print(f"    page rows {top}-{bottom}; artwork "
+          f"{cropped.width}x{cropped.height} -> squared to {side}px")
     return square
 
 
@@ -179,16 +225,23 @@ def main() -> int:
     print("trimming artwork...")
     mark = load_trimmed()
 
-    # In-app asset: transparent, so it sits on any of the three themes.
+    # The adaptive background takes the artwork's OWN colour rather than a
+    # hardcoded plate. This icon is a black rounded square; a cream
+    # background behind it would show as a pale ring wherever the launcher's
+    # mask is wider than the artwork.
+    ground = mark.convert("RGB").getpixel((mark.width // 2, 3))
+
     BRAND.mkdir(parents=True, exist_ok=True)
     mark.resize((512, 512), Image.LANCZOS).save(BRAND / "logo.png")
     print(f"wrote {(BRAND / 'logo.png').relative_to(ROOT)}")
 
-    # Legacy square icon: the mark nearly fills it.
+    # Legacy square icon: the artwork IS a finished icon, so it fills the
+    # square edge to edge rather than being inset on a plate.
     for bucket, size in DENSITIES.items():
         d = RES / f"mipmap-{bucket}"
         d.mkdir(parents=True, exist_ok=True)
-        flatten(mark, size, 0.92).convert("RGB").save(d / "ic_launcher.png")
+        mark.resize((size, size), Image.LANCZOS).convert("RGB").save(
+            d / "ic_launcher.png")
 
         # Adaptive foreground: same mark, but shrunk into the safe zone and
         # left transparent so the background layer shows through the mask.
@@ -214,7 +267,7 @@ def main() -> int:
         '</adaptive-icon>\n',
         encoding="utf-8")
 
-    hexbg = "#%02X%02X%02X" % BACKGROUND
+    hexbg = "#%02X%02X%02X" % ground
     (RES / "values" / "ic_launcher_background.xml").write_text(
         '<?xml version="1.0" encoding="utf-8"?>\n'
         '<resources>\n'

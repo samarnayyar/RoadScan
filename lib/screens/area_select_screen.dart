@@ -710,12 +710,27 @@ class _AreaCard extends StatelessWidget {
             color: c.surfaceAlt,
             borderRadius: BorderRadius.circular(22),
             border: Border.all(
-              // Stronger in light mode: the cards are pale maps on a pale
-              // background, so a faint edge left them floating without a
-              // defined boundary.
+              // Light mode gets a near-BLACK edge, not a tinted one.
+              //
+              // The accent colours are deliberately pale pastels, which works
+              // on the dark background where any light edge separates the card
+              // from it. On the light background a pastel edge against a pale
+              // map thumbnail is almost the same luminance on both sides, so
+              // the cards had no defined boundary at all and the page read as
+              // one flat wash. Keeping a trace of the accent in the mix stops
+              // the four tiles becoming identical.
               color: busy
                   ? accent
-                  : accent.withValues(alpha: dark ? 0.34 : 0.62),
+                  : dark
+                      ? accent.withValues(alpha: 0.34)
+                      // Mid GREY, not near-black. Black edges defined the
+                      // cards but turned four soft map tiles into four heavy
+                      // boxes that outweighed the maps inside them. Grey still
+                      // separates card from ground -- the problem the pastel
+                      // edge could not solve -- without the tiles reading as
+                      // the loudest thing on the page. A trace of the accent
+                      // keeps the four from looking identical.
+                      : Color.lerp(accent, const Color(0xFF5E6872), 0.82)!,
               width: busy ? 1.8 : (dark ? 1.1 : 1.4),
             ),
             boxShadow: [
@@ -948,6 +963,16 @@ class _CampusBackdrop extends CustomPainter {
     final h = size.height;
     final dark = colors.isDark;
     final accent = colors.accent;
+    // Light mode draws the backdrop in near-BLACK, not in the accent.
+    //
+    // The accent is a mid blue; on the pale light background every stroke was
+    // within a few percent luminance of the ground behind it, so the highway
+    // and the radar rings dissolved into a flat blue-grey wash. Dark ink gives
+    // the same drawing real contrast. Dark and neon keep the accent, where a
+    // glowing line against a near-black ground is the whole point.
+    final line = colors.kind == AppThemeKind.light
+        ? const Color(0xFF0B1219)
+        : accent;
 
     // Background. Neon gets a FLAT fill rather than a gradient: on an OLED
     // panel any lift off #000 turns pixels back on and loses the depth the
@@ -977,7 +1002,10 @@ class _CampusBackdrop extends CustomPainter {
     //   dark  deliberately the most restrained of the three
     final k = switch (colors.kind) {
       AppThemeKind.neon => 1.9,
-      AppThemeKind.light => 1.5,
+      // Light carries the backdrop in dark ink rather than the accent, and
+      // wants it TONED UP: at 0.95 the rings and lane lines were legible but
+      // still ghostly, so the motif read as a smudge rather than as a drawing.
+      AppThemeKind.light => 1.45,
       AppThemeKind.dark => 1.0,
     };
 
@@ -1005,7 +1033,7 @@ class _CampusBackdrop extends CustomPainter {
     final ringPaint = Paint()
       ..style = PaintingStyle.stroke
       ..strokeWidth = 1.3
-      ..color = accent.withValues(alpha: (0.26 * k).clamp(0.0, 1.0));
+      ..color = line.withValues(alpha: (0.26 * k).clamp(0.0, 1.0));
 
     for (var i = 1; i <= 5; i++) {
       canvas.drawCircle(centre, maxR * (i / 5), ringPaint);
@@ -1021,7 +1049,7 @@ class _CampusBackdrop extends CustomPainter {
         centre + Offset(math.cos(a) * outer, math.sin(a) * outer),
         Paint()
           ..strokeWidth = i % 3 == 0 ? 2.0 : 1.3
-          ..color = accent.withValues(alpha: (0.34 * k).clamp(0.0, 1.0)),
+          ..color = line.withValues(alpha: (0.34 * k).clamp(0.0, 1.0)),
       );
     }
 
@@ -1057,8 +1085,8 @@ class _CampusBackdrop extends CustomPainter {
           // solid shape with a hard edge -- it stopped reading as a sweep and
           // started reading as a stray panel across the bottom of the screen.
           colors: [
-            accent.withValues(alpha: 0.0),
-            accent.withValues(alpha: (0.09 * k).clamp(0.0, 1.0)),
+            line.withValues(alpha: 0.0),
+            line.withValues(alpha: (0.09 * k).clamp(0.0, 1.0)),
           ],
         ).createShader(
             Rect.fromCircle(center: Offset.zero, radius: maxR)),
@@ -1069,7 +1097,7 @@ class _CampusBackdrop extends CustomPainter {
       Offset(maxR, 0),
       Paint()
         ..strokeWidth = 2.0
-        ..color = accent.withValues(alpha: (0.45 * k).clamp(0.0, 1.0)),
+        ..color = line.withValues(alpha: (0.45 * k).clamp(0.0, 1.0)),
     );
     canvas.restore();
 
@@ -1129,7 +1157,7 @@ class _CampusBackdrop extends CustomPainter {
     final bracketPaint = Paint()
       ..style = PaintingStyle.stroke
       ..strokeWidth = 1.6
-      ..color = accent.withValues(alpha: (0.26 * k).clamp(0.0, 1.0));
+      ..color = line.withValues(alpha: (0.26 * k).clamp(0.0, 1.0));
     for (final corner in [
       [inset, inset, 1.0, 1.0],
       [w - inset, inset, -1.0, 1.0],
@@ -1157,6 +1185,16 @@ class _CampusBackdrop extends CustomPainter {
     final w = size.width;
     final h = size.height;
     final accent = colors.accent;
+    // Light mode draws the backdrop in near-BLACK, not in the accent.
+    //
+    // The accent is a mid blue; on the pale light background every stroke was
+    // within a few percent luminance of the ground behind it, so the highway
+    // and the radar rings dissolved into a flat blue-grey wash. Dark ink gives
+    // the same drawing real contrast. Dark and neon keep the accent, where a
+    // glowing line against a near-black ground is the whole point.
+    final line = colors.kind == AppThemeKind.light
+        ? const Color(0xFF0B1219)
+        : accent;
 
     // Vanishing point at top CENTRE, with the carriageway opening out to far
     // beyond both screen edges.
@@ -1187,7 +1225,7 @@ class _CampusBackdrop extends CustomPainter {
         Offset(vp.dx + spread, y),
         Paint()
           ..strokeWidth = 1.0
-          ..color = accent.withValues(
+          ..color = line.withValues(
               alpha: ((0.012 + 0.042 * t) * k).clamp(0.0, 1.0)),
       );
     }
@@ -1206,9 +1244,9 @@ class _CampusBackdrop extends CustomPainter {
           begin: Alignment.topCenter,
           end: Alignment.bottomCenter,
           colors: [
-            accent.withValues(alpha: 0.0),
-            accent.withValues(alpha: (0.055 * k).clamp(0.0, 1.0)),
-            accent.withValues(alpha: 0.0),
+            line.withValues(alpha: 0.0),
+            line.withValues(alpha: (0.055 * k).clamp(0.0, 1.0)),
+            line.withValues(alpha: 0.0),
           ],
           stops: const [0.0, 0.34, 0.72],
         ).createShader(Rect.fromLTRB(0, vp.dy, w, h)),
@@ -1229,7 +1267,7 @@ class _CampusBackdrop extends CustomPainter {
           Paint()
             ..strokeWidth = 1.2 + 1.8 * t0
             ..strokeCap = StrokeCap.round
-            ..color = accent
+            ..color = line
                 .withValues(alpha: (0.16 * fade * k).clamp(0.0, 1.0)),
         );
       }
@@ -1259,7 +1297,7 @@ class _CampusBackdrop extends CustomPainter {
           Paint()
             ..strokeWidth = 0.8 + 2.4 * t0
             ..strokeCap = StrokeCap.round
-            ..color = accent.withValues(
+            ..color = line.withValues(
                 alpha: ((0.05 + 0.14 * t0) * fade * k).clamp(0.0, 1.0)),
         );
       }

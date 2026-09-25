@@ -3,12 +3,16 @@ import 'package:image_picker/image_picker.dart';
 import 'package:intl/intl.dart';
 import 'package:maplibre_gl/maplibre_gl.dart' show LatLng;
 
+import '../config/app_theme.dart';
+import '../services/theme_controller.dart' show AppThemeKind;
 import '../models/detection.dart';
+import '../models/review_verdict.dart';
 import '../services/detection_service.dart';
 import '../services/location_service.dart';
 import '../services/photo_metadata.dart';
 import '../services/severity.dart';
 import '../services/supabase_service.dart';
+import '../widgets/app_snackbar.dart';
 import '../widgets/detection_overlay.dart';
 import 'adjust_location_screen.dart';
 
@@ -151,14 +155,29 @@ class _CaptureScreenState extends State<CaptureScreen> {
       return 'This photo was taken on $when. The report will be dated then, '
           'not now, so its freshness is honest.';
     }
-    if (detections.isEmpty) {
-      return DetectionService.instance.usingFallbackModel
-          ? 'No fine-tuned model bundled yet, so nothing can be detected. '
-              'See ml/train_export.py.'
-          : 'No pothole or crack found. Retake closer, or submit anyway if you '
-              'can see damage.';
+    if (DetectionService.instance.usingFallbackModel) {
+      return 'No fine-tuned model bundled yet, so nothing can be detected. '
+          'See ml/train_export.py.';
     }
-    return null;
+
+    switch (verdictFor(detections)) {
+      case ReviewVerdict.accept:
+        // Confident enough to file unchallenged; nothing to say.
+        return null;
+
+      case ReviewVerdict.confirm:
+        // Deliberately names what it thinks it saw and how sure it is. "Please
+        // confirm" with no evidence just trains people to tap through.
+        final d = strongest(detections)!;
+        final pct = (d.confidence * 100).round();
+        return 'Possible ${d.hazard.label.toLowerCase()} found, but only '
+            '$pct% confident. Check the box looks right before submitting, or '
+            'retake closer.';
+
+      case ReviewVerdict.reject:
+        return 'No pothole or crack detected. If you can see damage the model '
+            'missed, submit it for manual review and an admin will check it.';
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -194,11 +213,82 @@ class _CaptureScreenState extends State<CaptureScreen> {
     });
   }
 
+  /// Asks what the user saw, then files the report for human review.
+  ///
+  /// The note is not optional decoration: the reviewer is looking at a photo
+  /// the model found nothing in, and without a claim to check against they
+  /// have no idea what they are supposed to be judging.
+  Future<void> _sendForReview() async {
+    final note = await showDialog<String>(
+      context: context,
+      builder: (ctx) {
+        final c = ctx.rs;
+        final controller = TextEditingController();
+        return AlertDialog(
+          backgroundColor: c.surface,
+          title: Text('Send for human review',
+              style: TextStyle(color: c.textPrimary, fontSize: 17)),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'The detector found nothing here. Your photo, its time and '
+                'its location will be sent for an admin to check. It will not '
+                'appear on the map unless they confirm it.',
+                style: TextStyle(color: c.textSecondary, fontSize: 12.5),
+              ),
+              const SizedBox(height: 14),
+              TextField(
+                controller: controller,
+                autofocus: true,
+                maxLength: 140,
+                style: TextStyle(color: c.textPrimary, fontSize: 14),
+                decoration: InputDecoration(
+                  labelText: 'What can you see?',
+                  labelStyle: TextStyle(color: c.textMuted),
+                  hintText: 'e.g. deep pothole, edge of the road has collapsed',
+                  hintStyle: TextStyle(color: c.textMuted, fontSize: 12),
+                  enabledBorder: OutlineInputBorder(
+                      borderSide: BorderSide(color: c.border)),
+                  focusedBorder: OutlineInputBorder(
+                      borderSide: BorderSide(color: c.accent)),
+                ),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(),
+              style: TextButton.styleFrom(foregroundColor: c.textMuted),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(ctx).pop(
+                  controller.text.trim().isEmpty
+                      ? 'Damage reported by user; no description given.'
+                      : controller.text.trim()),
+              style: FilledButton.styleFrom(
+                  backgroundColor: c.accent, foregroundColor: c.background),
+              child: const Text('Send'),
+            ),
+          ],
+        );
+      },
+    );
+
+    if (note == null || !mounted) return;
+    await _submit(reviewNote: note);
+  }
+
   // ---------------------------------------------------------------------------
   // Submit
   // ---------------------------------------------------------------------------
 
-  Future<void> _submit() async {
+  /// [reviewNote] non-null sends the report to the human review queue rather
+  /// than straight to the map. Used when the detector found nothing and the
+  /// user is asserting damage anyway.
+  Future<void> _submit({String? reviewNote}) async {
     final meta = _meta;
     final result = _result;
     if (meta == null || result == null || !meta.hasLocation) return;
@@ -223,17 +313,20 @@ class _CaptureScreenState extends State<CaptureScreen> {
         severity: result.isEmpty ? SeverityClass.low : result.severity,
         hazard: result.isEmpty ? HazardClass.pothole : result.hazard,
         capturedAt: meta.capturedAt,
+        reviewNote: reviewNote,
       );
 
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(outcome.wasMerged
-              ? 'Added to an existing report nearby - now confirmed by '
-                  '${outcome.confirmations} devices.'
-              : 'New hazard reported. Thanks!'),
-          duration: const Duration(seconds: 4),
-        ),
+      showAppSnack(
+        context,
+        reviewNote != null
+            ? 'Sent for review. It will appear on the map only once an admin '
+                'confirms the damage.'
+            : outcome.wasMerged
+                ? 'Added to an existing report nearby - now confirmed by '
+                    '${outcome.confirmations} devices.'
+                : 'New hazard reported. Thanks!',
+        duration: const Duration(seconds: 5),
       );
       Navigator.of(context).pop(CaptureResult.submitted);
     } catch (e) {
@@ -257,14 +350,19 @@ class _CaptureScreenState extends State<CaptureScreen> {
     // intercepting back to attach a reason would only risk trapping the user
     // on this screen, and "submitted or not" is the only distinction that
     // actually changes what happens next.
+    final c = context.rs;
     return Scaffold(
+      backgroundColor: c.background,
       appBar: AppBar(
+        backgroundColor: c.background,
+        foregroundColor: c.textPrimary,
+        elevation: 0,
         title: Text(widget.source == ImageSource.camera
             ? 'Report a hazard'
             : 'Upload a photo'),
       ),
       body: meta == null
-          ? const Center(child: CircularProgressIndicator())
+          ? Center(child: CircularProgressIndicator(color: c.accent))
           : Column(
               children: [
                 Expanded(child: _buildPreview(meta)),
@@ -289,6 +387,19 @@ class _CaptureScreenState extends State<CaptureScreen> {
               imageAspectRatio: meta.aspectRatio,
               driver: result.driver,
             ),
+          // Said over the photo, not only in the panel below.
+          //
+          // The panel shows one notice at a time and location outranks
+          // everything, so a missing GPS fix used to hide the fact that
+          // nothing was detected at all. Those are two different problems and
+          // the user needs both: the verdict belongs on the image it is a
+          // verdict about.
+          if (_stage == _Stage.review &&
+              result != null &&
+              !DetectionService.instance.usingFallbackModel &&
+              verdictFor(result.detections) == ReviewVerdict.reject)
+            const Center(child: _NothingFoundBadge()),
+
           if (_stage == _Stage.analysing)
             Container(
               color: Colors.black54,
@@ -313,14 +424,16 @@ class _CaptureScreenState extends State<CaptureScreen> {
     final result = _result;
     final canSubmit = _stage == _Stage.review && meta.hasLocation;
 
+    final c = context.rs;
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.fromLTRB(16, 14, 16, 16),
       decoration: BoxDecoration(
-        color: Theme.of(context).colorScheme.surface,
+        color: c.surface,
+        border: Border(top: BorderSide(color: c.border)),
         boxShadow: const [
           BoxShadow(
-              color: Color(0x1A000000),
+              color: Color(0x33000000),
               blurRadius: 12,
               offset: Offset(0, -2)),
         ],
@@ -342,35 +455,98 @@ class _CaptureScreenState extends State<CaptureScreen> {
             _MetadataRow(meta: meta, onEditLocation: _adjustLocation),
             const SizedBox(height: 12),
 
+            // The escape hatch for a real hazard the model missed.
+            //
+            // Offered only when nothing was detected, because that is the only
+            // case where the app would otherwise refuse a genuine report. It
+            // still requires a location -- a report nobody can find is not a
+            // report -- and it files the pin as `pending`, hidden from the map
+            // until an admin approves it. See 004_human_review.sql.
+            if (result != null &&
+                !DetectionService.instance.usingFallbackModel &&
+                verdictFor(result.detections) == ReviewVerdict.reject) ...[
+              SizedBox(
+                width: double.infinity,
+                child: OutlinedButton.icon(
+                  onPressed: canSubmit ? _sendForReview : null,
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: c.textPrimary,
+                    side: BorderSide(color: c.accent.withValues(alpha: 0.6)),
+                    padding: const EdgeInsets.symmetric(vertical: 11),
+                  ),
+                  icon: const Icon(Icons.how_to_reg_outlined, size: 18),
+                  label: Text(
+                    meta.hasLocation
+                        ? 'I can see damage - send for human review'
+                        : 'Set a location first to send for review',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontSize: 12.5),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 10),
+            ],
+
             Row(
               children: [
+                // flex 3 : 4, not 1 : 2.
+                //
+                // At 1:2 the retake button got a third of the row, which is
+                // narrower than "Retake" plus its icon at this text size -- the
+                // label wrapped mid-word and rendered as "Retak / e". maxLines
+                // and ellipsis below are the backstop for the longer "Pick
+                // another" and for larger system font scales.
                 Expanded(
+                  flex: 3,
                   child: OutlinedButton.icon(
                     onPressed: _stage == _Stage.submitting
                         ? null
                         : () => _pick(widget.source),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: c.accent,
+                      side: BorderSide(color: c.border),
+                      padding: const EdgeInsets.symmetric(horizontal: 8),
+                    ),
                     icon: const Icon(Icons.refresh, size: 18),
-                    label: Text(widget.source == ImageSource.camera
-                        ? 'Retake'
-                        : 'Pick another'),
+                    label: Text(
+                      widget.source == ImageSource.camera
+                          ? 'Retake'
+                          : 'Pick another',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(fontSize: 13),
+                    ),
                   ),
                 ),
-                const SizedBox(width: 12),
+                const SizedBox(width: 10),
                 Expanded(
-                  flex: 2,
+                  flex: 4,
                   child: FilledButton.icon(
                     onPressed: canSubmit ? _submit : null,
+                    style: FilledButton.styleFrom(
+                      backgroundColor: c.accent,
+                      foregroundColor: c.background,
+                      disabledBackgroundColor: c.surfaceAlt,
+                      disabledForegroundColor: c.textMuted,
+                      padding: const EdgeInsets.symmetric(horizontal: 8),
+                    ),
                     icon: _stage == _Stage.submitting
-                        ? const SizedBox(
+                        ? SizedBox(
                             width: 16,
                             height: 16,
                             child: CircularProgressIndicator(
-                                strokeWidth: 2, color: Colors.white),
+                                strokeWidth: 2, color: c.background),
                           )
                         : const Icon(Icons.upload_outlined, size: 18),
-                    label: Text(_stage == _Stage.submitting
-                        ? 'Submitting...'
-                        : 'Submit report'),
+                    label: Text(
+                      _stage == _Stage.submitting
+                          ? 'Submitting...'
+                          : 'Submit report',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(fontSize: 13),
+                    ),
                   ),
                 ),
               ],
@@ -393,15 +569,17 @@ class _MetadataRow extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final c = context.rs;
     final fmt = DateFormat('d MMM yyyy, HH:mm');
-    final subtle = TextStyle(fontSize: 11.5, color: Colors.grey.shade700);
+    final subtle = TextStyle(fontSize: 11.5, color: c.textSecondary);
+    final iconColor = c.textMuted;
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Row(
           children: [
-            Icon(Icons.schedule, size: 15, color: Colors.grey.shade600),
+            Icon(Icons.schedule, size: 15, color: iconColor),
             const SizedBox(width: 5),
             Expanded(
               child: Text(
@@ -432,9 +610,15 @@ class _MetadataRow extends StatelessWidget {
           ],
         ),
         const SizedBox(height: 6),
+        // Coordinates on their own line, the action beneath them.
+        //
+        // Side by side, the coordinate string and the button competed for one
+        // row: the text was squeezed into an Expanded that truncated it, while
+        // "Set location" sat far right where it read as unrelated to the "No
+        // location" it was offering to fix.
         Row(
           children: [
-            Icon(Icons.place_outlined, size: 15, color: Colors.grey.shade600),
+            Icon(Icons.place_outlined, size: 15, color: iconColor),
             const SizedBox(width: 5),
             Expanded(
               child: Text(
@@ -446,16 +630,20 @@ class _MetadataRow extends StatelessWidget {
                 style: subtle,
               ),
             ),
-            TextButton.icon(
+          ],
+        ),
+        Align(
+          alignment: Alignment.centerLeft,
+          child: TextButton.icon(
               onPressed: onEditLocation,
               icon: const Icon(Icons.edit_location_alt_outlined, size: 16),
               label: Text(meta.hasLocation ? 'Adjust' : 'Set location'),
               style: TextButton.styleFrom(
+                foregroundColor: c.accent,
                 visualDensity: VisualDensity.compact,
                 padding: const EdgeInsets.symmetric(horizontal: 8),
               ),
-            ),
-          ],
+          ),
         ),
       ],
     );
@@ -496,7 +684,7 @@ class _SeverityChip extends StatelessWidget {
         Text(
           'score ${result.score.toStringAsFixed(2)}  -  '
           '${result.detections.length} found',
-          style: TextStyle(color: Colors.grey.shade700, fontSize: 12),
+          style: TextStyle(color: context.rs.textSecondary, fontSize: 12),
         ),
       ],
     );
@@ -505,6 +693,50 @@ class _SeverityChip extends StatelessWidget {
 
 enum _Tone { info, error }
 
+/// "Nothing found", stated over the photo itself.
+///
+/// Semi-opaque rather than solid so the user can still see what the model was
+/// looking at while reading the verdict -- being told "no pothole" over a
+/// hidden photo is how people conclude the app is broken.
+class _NothingFoundBadge extends StatelessWidget {
+  const _NothingFoundBadge();
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      margin: const EdgeInsets.symmetric(horizontal: 28),
+      padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 14),
+      decoration: BoxDecoration(
+        color: Colors.black.withValues(alpha: 0.72),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.22)),
+      ),
+      child: const Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.search_off, color: Colors.white, size: 26),
+          SizedBox(height: 8),
+          Text(
+            'No pothole or crack detected',
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              color: Colors.white,
+              fontSize: 14,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+          SizedBox(height: 4),
+          Text(
+            'Retake closer, or send it for a human to check',
+            textAlign: TextAlign.center,
+            style: TextStyle(color: Color(0xFFD7DDE4), fontSize: 11),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class _Note extends StatelessWidget {
   const _Note({required this.text, required this.tone});
   final String text;
@@ -512,22 +744,40 @@ class _Note extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final c = context.rs;
     final isError = tone == _Tone.error;
+
+    // Error keeps a fixed red pair rather than a theme colour: it has to read
+    // as "something is wrong" identically in dark, light and neon, and the
+    // palettes have no red of their own. The info tone follows the theme,
+    // because it is ordinary guidance and a hardcoded pale blue panel looked
+    // pasted on over the dark and neon backgrounds.
+    final bg = isError
+        ? const Color(0xFFD32F2F).withValues(alpha: 0.14)
+        : c.accent.withValues(alpha: 0.12);
+    final fg = isError
+        ? (c.kind == AppThemeKind.light
+            ? const Color(0xFF8C2F26)
+            : const Color(0xFFFF9C91))
+        : c.textSecondary;
+
     return Container(
       width: double.infinity,
-      margin: const EdgeInsets.only(bottom: 6),
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      margin: const EdgeInsets.only(bottom: 5),
+      padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 6),
       decoration: BoxDecoration(
-        color: isError ? const Color(0xFFFDECEA) : const Color(0xFFEFF4FB),
+        color: bg,
         borderRadius: BorderRadius.circular(8),
-      ),
-      child: Text(
-        text,
-        style: TextStyle(
-          fontSize: 12,
-          color: isError ? const Color(0xFF8C2F26) : const Color(0xFF244A78),
+        border: Border.all(
+          color: isError
+              ? const Color(0xFFD32F2F).withValues(alpha: 0.35)
+              : c.accent.withValues(alpha: 0.30),
         ),
       ),
+      // 10pt, down from 12. The panel competes with the photo for a small
+      // screen and the notice was taking three lines of prime space for what
+      // is, at most, one instruction.
+      child: Text(text, style: TextStyle(fontSize: 10, height: 1.3, color: fg)),
     );
   }
 }

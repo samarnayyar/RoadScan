@@ -1,5 +1,7 @@
 import 'package:maplibre_gl/maplibre_gl.dart';
 
+import '../models/detection.dart' show HazardClass;
+
 /// Every tunable number in RoadScan lives here, so the viva-day question
 /// "why 20 metres?" has one place to point at.
 class AppConfig {
@@ -214,9 +216,60 @@ class AppConfig {
   /// finishes -- it will NOT detect potholes, it just keeps the pipeline alive.
   static const String fallbackModelId = 'yolo26n';
 
-  /// Below this, a detection is noise. Tuned on the assumption of a fine-tuned
-  /// 2-class model; re-check after training on real Bidholi photos.
-  static const double minConfidence = 0.35;
+  // --------------------------------------------------------------------------
+  // Detection thresholds
+  //
+  // MEASURED, not guessed. Read off the precision/recall curves of the trained
+  // YOLO11n on its 3,212-image validation split (pothole mAP50 0.733, crack
+  // mAP50 0.461). The previous single 0.35 was a placeholder written before any
+  // model existed.
+  //
+  //   pothole                        crack
+  //   conf   prec   recall   F1      conf   prec   recall   F1
+  //   0.25  0.730   0.696  0.712     0.25  0.511   0.484  0.497
+  //   0.30  0.772   0.677  0.721     0.30  0.568   0.441  0.496
+  //   0.35  0.805   0.656  0.723     0.35  0.619   0.410  0.493
+  //   0.50  0.878   0.587  0.704     0.50  0.720   0.312  0.436
+  //   0.60  0.916   0.520  0.663     0.60  0.815   0.238  0.369
+  //
+  // Three tiers, because the app makes two different decisions and they want
+  // different operating points. A single threshold has to be either precise or
+  // sensitive; it cannot be both, and this app needs both at different moments.
+  // --------------------------------------------------------------------------
+
+  /// Anything below this is noise and is discarded outright.
+  ///
+  /// Pushed down into the plugin so native-side NMS drops weak boxes before
+  /// they cross the platform channel. 0.25 is where pothole precision is still
+  /// 0.73 -- low enough to catch a marginal real pothole and offer it for
+  /// confirmation, high enough not to flood the screen with speculative boxes.
+  static const double detectionFloor = 0.25;
+
+  /// At or above this, a detection is trusted enough to file without asking.
+  ///
+  /// Per class, because the two are not equally reliable. Pothole reaches 0.878
+  /// precision at 0.50, so roughly one auto-filed pin in eight is wrong -- the
+  /// cost being a hazard on the map that is not there.
+  ///
+  /// Crack never gets there at a usable recall: 0.60 buys 0.815 precision but
+  /// keeps only 24% of real cracks. It is set high deliberately, which means
+  /// most cracks route through confirmation rather than being filed silently.
+  /// That is the honest outcome for a class the model is weak at, and it is
+  /// better than either spraying false cracks onto the map or rejecting every
+  /// crack report outright.
+  static double autoAcceptFor(HazardClass hazard) =>
+      hazard == HazardClass.crack ? 0.60 : 0.50;
+
+  /// Between [detectionFloor] and the auto-accept bar, the user is asked to
+  /// confirm rather than being accepted or rejected.
+  ///
+  /// This band is what makes rejection defensible. A detector outputs nothing
+  /// for a photo of a ceiling, for a good road, AND for a genuinely broken road
+  /// it failed to recognise. The first two are correct rejections; the third is
+  /// a real report being thrown away, and no threshold anywhere removes it.
+  /// Confirmation catches the near-misses; the manual-review escalation has to
+  /// catch the rest.
+  static const double minConfidence = detectionFloor;
 
   // --------------------------------------------------------------------------
   // Dedup / confidence

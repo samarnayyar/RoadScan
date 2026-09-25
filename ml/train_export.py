@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import shutil
 import sys
+from collections import Counter
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -45,13 +46,26 @@ CLASSES = ["pothole", "crack"]
 # morphology and road construction in the RDD India images are far closer to
 # Bidholi than the Japan/Czech splits are.
 #
-#   D00 longitudinal crack
-#   D10 transverse crack
+#   D00 longitudinal crack          D01 the same, along a construction joint
+#   D10 transverse crack            D11 the same, along a construction joint
 #   D20 alligator crack
 #   D40 pothole
 #
-# D43/D44 are markings and crosswalk blur -- not road damage, so dropped.
-RDD_MAP = {"D00": "crack", "D10": "crack", "D20": "crack", "D40": "pothole"}
+# D01/D11 are included because the joint/non-joint distinction is about how
+# the crack formed, not what it is to ride over -- the app has one `crack`
+# class and both belong in it.
+#
+# Everything else is deliberately dropped, because none of it is damage:
+# D43 white-line blur, D44 crosswalk blur, D50 utility/manhole cover. D50 is
+# worth a note -- a manhole is one of the strongest pothole look-alikes
+# there is, so those images are valuable, but as NEGATIVES rather than as a
+# damage class. Dropping the box leaves the image available for exactly that.
+RDD_MAP = {
+    "D00": "crack", "D01": "crack",
+    "D10": "crack", "D11": "crack",
+    "D20": "crack",
+    "D40": "pothole",
+}
 
 
 def _require_ultralytics():
@@ -85,11 +99,31 @@ def cmd_prepare(args: argparse.Namespace) -> None:
     )
     print(f"wrote {DATA_YAML}")
 
+    # Positives first, from every source, then negatives -- the negative cap
+    # is a fraction of the positives, so it can only be sized correctly once
+    # they are all in. See _ingest_clean_frames.
+    clean_frames: list[Path] = []
+
     if args.rdd2022:
-        _remap_rdd(Path(args.rdd2022))
+        rdd = Path(args.rdd2022)
+        # RDD2022 as published is VOC XML; a Roboflow re-export of it is YOLO.
+        # Pick the reader that matches what is actually on disk rather than
+        # making the caller remember which one they have.
+        if list(rdd.rglob("*.xml")):
+            clean_frames = _ingest_rdd_voc(rdd, args.crack_ratio)
+        else:
+            _remap_rdd(rdd)
 
     if args.roboflow:
         _ingest_roboflow(Path(args.roboflow))
+
+    if clean_frames:
+        _ingest_clean_frames(clean_frames, args.negative_ratio)
+
+    if args.negatives:
+        _ingest_negatives(Path(args.negatives))
+
+    _dedupe_prepared()
 
     n_train = len(list((DATASET_DIR / "images" / "train").glob("*")))
     n_val = len(list((DATASET_DIR / "images" / "val").glob("*")))
@@ -105,6 +139,100 @@ def cmd_prepare(args: argparse.Namespace) -> None:
             "terrain Uttarakhand data, and a model trained only on it will miss\n"
             "the shaded, gravel-edged damage typical of these roads."
         )
+
+
+def _ingest_negatives(root: Path) -> None:
+    """Ingests images that contain NO road damage, as empty-label examples.
+
+    This is the half of the dataset that makes the app's reject path work.
+    The pothole datasets are ~100% damage-present, so a model trained only on
+    them has never once been shown a good road, let alone a photo of a ceiling
+    -- and a detector that has never seen a negative will happily invent boxes
+    on both. Users WILL upload junk, deliberately and accidentally, and "no
+    detection" is the only signal the app has to reject on.
+
+    A negative is an image with an EMPTY label file. That is a real training
+    signal in YOLO, not a missing annotation: every box the model predicts on
+    one is a false positive it gets penalised for.
+
+    Subdirectories are only used for reporting -- the suggested layout is
+    road-ok/, road-lookalike/ and not-road/ so the mix stays auditable, but
+    every image ends up as the same empty-label example either way.
+
+    WARNING: anything in here that actually does contain a pothole teaches the
+    model to miss potholes, which is worse than not adding it. Dashcam sets
+    like BDD100K do contain damaged road, so they need filtering before they
+    land here.
+    """
+    if not root.exists():
+        sys.exit(f"negatives path not found: {root}")
+
+    exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+    imgs = [p for p in sorted(root.rglob("*")) if p.suffix.lower() in exts]
+    if not imgs:
+        sys.exit(f"no images found under {root}")
+
+    by_group = Counter()
+    counts = {"train": 0, "val": 0}
+    for img in imgs:
+        rel = img.relative_to(root)
+        group = rel.parts[0] if len(rel.parts) > 1 else "(root)"
+        by_group[group] += 1
+
+        split = "train" if (hash_name(img.stem) % 100) < 80 else "val"
+        stem = f"neg_{group}_{img.stem}"
+        shutil.copy2(img, DATASET_DIR / "images" / split /
+                     f"{stem}{img.suffix.lower()}")
+        # Empty file, deliberately. See the docstring.
+        (DATASET_DIR / "labels" / split / f"{stem}.txt").write_text(
+            "", encoding="utf-8")
+        counts[split] += 1
+
+    print(f"ingested {len(imgs)} negatives "
+          f"({counts['train']} train, {counts['val']} val)")
+    for g, n in by_group.most_common():
+        print(f"    {g:20s} {n}")
+
+
+def _row_to_box(parts: list[str]) -> tuple[int, float, float, float, float] | None:
+    """Normalises one YOLO label row to `cls cx cy w h`.
+
+    Roboflow exports are not uniformly boxes even when you ask for a detection
+    format: an annotation drawn as a polygon comes out as
+    `cls x1 y1 x2 y2 ... xn yn`. In the smartathon pothole set, 1,076 of
+    25,630 rows across 352 files are polygons like that.
+
+    Ultralytics rejects the whole dataset on those ("labels require 5 columns
+    each"), so they have to be resolved at ingest rather than discovered on
+    the GPU. Taking the polygon's bounding box loses the mask, which this
+    project does not use -- the app draws rectangles -- so nothing of value
+    goes with it.
+
+    Returns None for a row that is neither, which the caller counts as
+    malformed rather than silently dropping.
+    """
+    if len(parts) < 5:
+        return None
+    try:
+        cid = int(parts[0])
+        vals = [float(v) for v in parts[1:]]
+    except ValueError:
+        return None
+
+    if len(vals) == 4:
+        cx, cy, w, h = vals
+        return cid, cx, cy, w, h
+
+    # A polygon: an even number of coordinates, at least three points.
+    if len(vals) >= 6 and len(vals) % 2 == 0:
+        xs, ys = vals[0::2], vals[1::2]
+        x1, x2 = min(xs), max(xs)
+        y1, y2 = min(ys), max(ys)
+        if x2 <= x1 or y2 <= y1:
+            return None
+        return cid, (x1 + x2) / 2, (y1 + y2) / 2, x2 - x1, y2 - y1
+
+    return None
 
 
 def _class_for(name: str) -> str | None:
@@ -162,15 +290,37 @@ def _ingest_roboflow(root: Path) -> None:
                      for n in rest.strip("[]").split(",") if n.strip()]
             break
 
-        # Block form, either  - pothole  or  0: pothole
+        # Block form, either
+        #     names:              or      names:
+        #     - pothole                     0: pothole
+        #     - crack                       1: crack
+        #
+        # Stopping correctly matters more than it looks. An earlier version
+        # continued while a line merely contained ':', which ran straight past
+        # the end of the list and swallowed the whole rest of the file --
+        # Roboflow's current export puts `names:` FIRST and follows it with
+        # `nc: 1`, `roboflow:` and its nested keys, so the class list came out
+        # as ['Pothole', '1', '', 'Public Domain', 'new-pothole-detection',
+        # 'https://...', ...]. Worse than noise: 'new-pothole-detection' and
+        # the project URL both contain "pothole", so _class_for mapped ids 4
+        # and 5 to the pothole class. Nothing referenced those ids in this
+        # dataset, so it happened to be harmless -- but a dataset that did use
+        # them would have been silently mislabelled.
+        #
+        # A list item starts with '-'. A dict entry is INDENTED. A new
+        # top-level key is neither, and ends the list.
         for follow in lines[i + 1:]:
             s = follow.strip()
-            if not s or not (s.startswith("-") or ":" in s):
+            if not s:
                 break
             if s.startswith("-"):
                 names.append(s[1:].strip().strip("'\""))
-            else:
+                continue
+            indented = follow[:1].isspace()
+            if indented and ":" in s:
                 names.append(s.split(":", 1)[1].strip().strip("'\""))
+                continue
+            break
         break
 
     if not names:
@@ -187,50 +337,398 @@ def _ingest_roboflow(root: Path) -> None:
             "Rename them in Roboflow (or extend _class_for) before ingesting."
         )
 
-    kept = dropped = copied = 0
-    for src_split, dst_split in (("train", "train"),
-                                 ("valid", "val"),
-                                 ("val", "val"),
-                                 ("test", "val")):
+    # Gather every file first, then deduplicate and re-split by image CONTENT.
+    #
+    # The export's own train/valid/test split cannot be trusted. Measured on
+    # smartathon/new-pothole-detection v2: 9,181 files hold only 7,054
+    # distinct pictures, and 1,068 of the 3,090 valid/test files -- 35% of the
+    # evaluation set -- are the same photograph as something in train. Trained
+    # on that, validation mAP is largely the model recognising pictures it was
+    # fitted on, and it picks the wrong checkpoint.
+    #
+    # Assigning the split from the image hash fixes both problems at once:
+    # every copy of a picture lands in the same split, so no picture can
+    # straddle the boundary, and the assignment is deterministic, so a re-run
+    # reproduces it exactly.
+    found: dict[int, tuple[Path, Path | None, str]] = {}
+    seen = 0
+    for src_split in ("train", "valid", "val", "test"):
         img_dir = root / src_split / "images"
         lbl_dir = root / src_split / "labels"
-        if not img_dir.exists() or not lbl_dir.exists():
+        if not img_dir.exists():
             continue
-
         for img in sorted(img_dir.iterdir()):
             if img.suffix.lower() not in {".jpg", ".jpeg", ".png"}:
                 continue
+            seen += 1
+            try:
+                h = _dhash(img)
+            except Exception:  # noqa: BLE001 -- unreadable image, skip it
+                continue
             txt = lbl_dir / f"{img.stem}.txt"
+            # First copy wins; they are the same picture, so which one is
+            # kept does not matter, only that exactly one is.
+            found.setdefault(h, (img, txt if txt.exists() else None, src_split))
 
-            out_lines = []
-            if txt.exists():
-                for line in txt.read_text(encoding="utf-8").splitlines():
-                    parts = line.split()
-                    if len(parts) < 5:
-                        continue
-                    try:
-                        old = int(parts[0])
-                    except ValueError:
-                        continue
-                    target = mapping.get(old)
-                    if target is None:
-                        dropped += 1
-                        continue
-                    parts[0] = str(CLASSES.index(target))
-                    out_lines.append(" ".join(parts))
-                    kept += 1
+    # If the export is already clean -- no picture in two splits -- its own
+    # split is honoured. tool/clean_dataset.py produces exactly that, and its
+    # 70/20/10 keeps a test holdout that a blind re-split here would dissolve.
+    # Only a leaky export gets re-split.
+    owners: dict[int, set[str]] = {}
+    for src_split in ("train", "valid", "val", "test"):
+        img_dir = root / src_split / "images"
+        if not img_dir.exists():
+            continue
+        for img in sorted(img_dir.iterdir()):
+            if img.suffix.lower() not in {".jpg", ".jpeg", ".png"}:
+                continue
+            try:
+                owners.setdefault(_dhash(img), set()).add(src_split)
+            except Exception:  # noqa: BLE001
+                continue
+    leaky = any(len(s) > 1 for s in owners.values())
+    print("source split is "
+          + ("LEAKY -- re-splitting by image hash"
+             if leaky else "clean -- keeping it"))
 
-            # Prefix the split so two Roboflow exports, or an RDD import and a
-            # Roboflow one, cannot collide on a shared filename.
-            stem = f"rf_{src_split}_{img.stem}"
-            shutil.copy2(img, DATASET_DIR / "images" / dst_split /
-                         f"{stem}{img.suffix.lower()}")
-            (DATASET_DIR / "labels" / dst_split / f"{stem}.txt").write_text(
-                "\n".join(out_lines), encoding="utf-8")
-            copied += 1
+    kept = dropped = copied = polygons = malformed = 0
+    split_counts = {"train": 0, "val": 0}
+    for h, (img, txt, src_split) in found.items():
+        if leaky:
+            # 80/20, keyed on the hash so it is stable across runs.
+            dst_split = "train" if (h % 100) < 80 else "val"
+        else:
+            # valid and test both become val: this pipeline trains on train
+            # and validates on val, and more val images make checkpoint
+            # selection less noisy.
+            dst_split = "train" if src_split == "train" else "val"
 
-    print(f"ingested Roboflow export: {copied} images, "
-          f"{kept} boxes kept, {dropped} dropped")
+        out_lines = []
+        if txt is not None:
+            for line in txt.read_text(encoding="utf-8").splitlines():
+                parts = line.split()
+                if not parts:
+                    continue
+                box = _row_to_box(parts)
+                if box is None:
+                    malformed += 1
+                    continue
+                old, cx, cy, bw, bh = box
+                target = mapping.get(old)
+                if target is None:
+                    dropped += 1
+                    continue
+                if len(parts) != 5:
+                    polygons += 1
+                out_lines.append(
+                    f"{CLASSES.index(target)} "
+                    f"{cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
+                kept += 1
+
+        # Prefix so two Roboflow exports, or an RDD import and a Roboflow one,
+        # cannot collide on a shared filename.
+        stem = f"rf_{img.stem}"
+        shutil.copy2(img, DATASET_DIR / "images" / dst_split /
+                     f"{stem}{img.suffix.lower()}")
+        (DATASET_DIR / "labels" / dst_split / f"{stem}.txt").write_text(
+            "\n".join(out_lines), encoding="utf-8")
+        copied += 1
+        split_counts[dst_split] += 1
+
+    print(f"ingested Roboflow export:")
+    print(f"    {seen} files on disk -> {len(found)} distinct pictures "
+          f"({seen - len(found)} duplicate copies dropped)")
+    print(f"    {'re-split by image hash' if leaky else 'split as supplied'}: "
+          f"{split_counts['train']} train, {split_counts['val']} val")
+    print(f"    {kept} boxes kept, {dropped} dropped")
+    if polygons:
+        print(f"    {polygons} polygon annotations converted to bounding "
+              f"boxes")
+    if malformed:
+        print(f"    {malformed} malformed rows skipped")
+    print(f"    copied {copied} images")
+
+
+def _dhash(path: Path, size: int = 8) -> int:
+    """Perceptual hash, used to spot the same picture under two filenames.
+
+    Roboflow renames every file to `<original>.rf.<hash>.<ext>` and re-encodes
+    it, so neither the name nor the bytes identify a picture -- only the
+    pixels do. dHash on a small grayscale reduction survives that re-encode
+    while still separating genuinely different photos.
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        sys.exit("Pillow is required to deduplicate:\n"
+                 "  pip install -r ml/requirements.txt")
+
+    im = Image.open(path).convert("L").resize((size + 1, size), Image.LANCZOS)
+    px = im.load()
+    bits = 0
+    for y in range(size):
+        for x in range(size):
+            bits = (bits << 1) | (1 if px[x, y] < px[x + 1, y] else 0)
+    return bits
+
+
+def _ingest_rdd_voc(root: Path, crack_ratio: float) -> list[Path]:
+    """Ingests RDD2022 as downloaded: PASCAL VOC XML, not YOLO.
+
+    Returns the damage-free frames it found WITHOUT ingesting them -- see
+    _ingest_clean_frames for why they are held back until the end.
+
+    RDD2022 ships `<country>/train/annotations/xmls/*.xml` alongside
+    `<country>/train/images/*.jpg`, with boxes as absolute xmin/ymin/xmax/ymax
+    and the image size in the XML itself -- so no image has to be opened to
+    convert, which matters at ~10k files.
+
+    Class balance is the real problem here, not the format. Across RDD2022
+    there are roughly 26k longitudinal + 12k transverse + 11k alligator crack
+    instances against 6.5k potholes. Collapsing all three crack types onto our
+    single `crack` class and ingesting the lot would leave the dataset about
+    seven parts crack to one part pothole -- and pothole is the class this app
+    exists to detect. So every image containing a pothole is kept, and
+    crack-only images are capped at `crack_ratio` times that count.
+    """
+    import xml.etree.ElementTree as ET
+
+    if not root.exists():
+        sys.exit(f"RDD2022 path not found: {root}")
+
+    xmls = sorted(root.rglob("*.xml"))
+    if not xmls:
+        sys.exit(f"No .xml annotations under {root}")
+    print(f"found {len(xmls)} VOC annotation files")
+
+    def image_for(xml_path: Path) -> Path | None:
+        # .../annotations/xmls/foo.xml  ->  .../images/foo.jpg
+        for up in (xml_path.parent.parent.parent, xml_path.parent.parent):
+            for ext in (".jpg", ".jpeg", ".png", ".JPG"):
+                cand = up / "images" / f"{xml_path.stem}{ext}"
+                if cand.exists():
+                    return cand
+        return None
+
+    parsed = []       # (img, [(cls, cx, cy, w, h)], has_pothole)
+    clean = []        # annotated, and annotated as having NO damage at all
+    unmapped = Counter()
+    skipped_no_img = 0
+
+    for xp in xmls:
+        img = image_for(xp)
+        if img is None:
+            skipped_no_img += 1
+            continue
+        try:
+            tree = ET.parse(xp)
+        except ET.ParseError:
+            continue
+        r = tree.getroot()
+        size = r.find("size")
+        if size is None:
+            continue
+        W = float(size.findtext("width") or 0)
+        H = float(size.findtext("height") or 0)
+        if W <= 0 or H <= 0:
+            continue
+
+        boxes = []
+        has_pothole = False
+        for obj in r.findall("object"):
+            raw = (obj.findtext("name") or "").strip()
+            target = RDD_MAP.get(raw)
+            if target is None:
+                unmapped[raw] += 1
+                continue
+            bb = obj.find("bndbox")
+            if bb is None:
+                continue
+            try:
+                x1 = float(bb.findtext("xmin")); y1 = float(bb.findtext("ymin"))
+                x2 = float(bb.findtext("xmax")); y2 = float(bb.findtext("ymax"))
+            except (TypeError, ValueError):
+                continue
+            x1, x2 = sorted((max(0.0, x1), min(W, x2)))
+            y1, y2 = sorted((max(0.0, y1), min(H, y2)))
+            if x2 - x1 < 1 or y2 - y1 < 1:
+                continue
+            boxes.append((
+                CLASSES.index(target),
+                ((x1 + x2) / 2) / W, ((y1 + y2) / 2) / H,
+                (x2 - x1) / W, (y2 - y1) / H,
+            ))
+            has_pothole |= target == "pothole"
+
+        # An image whose objects were ALL dropped still had objects, so it is
+        # not a verified clean road -- only a genuinely empty annotation is.
+        if boxes:
+            parsed.append((img, boxes, has_pothole))
+        elif not r.findall("object"):
+            clean.append(img)
+
+    if unmapped:
+        print("  classes present but not used: "
+              + ", ".join(f"{k}x{v}" for k, v in unmapped.most_common()))
+    if skipped_no_img:
+        print(f"  {skipped_no_img} annotations had no matching image")
+
+    pothole_imgs = [p for p in parsed if p[2]]
+    crack_imgs = [p for p in parsed if not p[2]]
+    cap = int(len(pothole_imgs) * crack_ratio)
+    # Deterministic pick rather than random, so re-running prepare gives the
+    # same dataset and a re-trained model is comparable to the last one.
+    crack_keep = sorted(crack_imgs, key=lambda p: p[0].name)[:cap]
+
+    print(f"  images with a pothole: {len(pothole_imgs)}  (all kept)")
+    print(f"  crack-only images:     {len(crack_imgs)}  "
+          f"(keeping {len(crack_keep)} at ratio {crack_ratio})")
+
+    kept = 0
+    counts = {"train": 0, "val": 0}
+    box_counts = Counter()
+    for img, boxes, _ in pothole_imgs + crack_keep:
+        # 80/20 on a hash of the name: stable across runs, and independent of
+        # the ordering above so potholes and cracks split the same way.
+        split = "train" if (hash_name(img.stem) % 100) < 80 else "val"
+        stem = f"rdd_{img.stem}"
+        shutil.copy2(img, DATASET_DIR / "images" / split /
+                     f"{stem}{img.suffix.lower()}")
+        (DATASET_DIR / "labels" / split / f"{stem}.txt").write_text(
+            "\n".join(f"{c} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}"
+                      for c, cx, cy, w, h in boxes),
+            encoding="utf-8")
+        for c, *_ in boxes:
+            box_counts[CLASSES[c]] += 1
+        counts[split] += 1
+        kept += 1
+
+    print(f"  ingested {kept} images ({counts['train']} train, "
+          f"{counts['val']} val)")
+    print(f"  boxes: " + ", ".join(f"{k}={v}" for k, v in box_counts.items()))
+
+    print(f"  clean (no-damage) frames available: {len(clean)}")
+    return clean
+
+
+def _dedupe_prepared() -> None:
+    """Final pass: no picture twice, and none straddling train/val.
+
+    Each ingest is internally clean, but they cannot see each other, and the
+    sources genuinely overlap -- the Roboflow pothole set contains images that
+    are also in RDD2022. Measured on the first combined build: 49 duplicated
+    pictures, 17 of them with one copy in train and another in val. Small, but
+    it is the same contamination that makes validation numbers untrustworthy,
+    and the fix is cheap.
+
+    Keeps the copy with the most boxes so annotation quality is never traded
+    away, and resolves a straddle by deleting the val copy rather than the
+    train one: a picture the model trained on is worthless as validation,
+    whereas losing one training example costs almost nothing.
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        print("\nskipping final dedupe: Pillow not installed")
+        return
+
+    def dhash(path: Path, size: int = 8) -> int:
+        im = Image.open(path).convert("L").resize((size + 1, size),
+                                                  Image.LANCZOS)
+        px = im.load()
+        bits = 0
+        for y in range(size):
+            for x in range(size):
+                bits = (bits << 1) | (1 if px[x, y] < px[x + 1, y] else 0)
+        return bits
+
+    def boxes_in(split: str, stem: str) -> int:
+        t = DATASET_DIR / "labels" / split / f"{stem}.txt"
+        if not t.exists():
+            return 0
+        return sum(1 for ln in t.read_text(encoding="utf-8").splitlines()
+                   if ln.strip())
+
+    groups: dict[int, list[tuple[str, Path]]] = {}
+    for split in ("train", "val"):
+        for img in (DATASET_DIR / "images" / split).iterdir():
+            try:
+                groups.setdefault(dhash(img), []).append((split, img))
+            except Exception:  # noqa: BLE001
+                continue
+
+    removed = straddles = 0
+    for members in groups.values():
+        if len(members) == 1:
+            continue
+        if len({s for s, _ in members}) > 1:
+            straddles += 1
+        # Prefer: most boxes, then a train copy over a val copy.
+        members.sort(key=lambda m: (-boxes_in(m[0], m[1].stem),
+                                    m[0] != "train", m[1].name))
+        for split, img in members[1:]:
+            img.unlink(missing_ok=True)
+            (DATASET_DIR / "labels" / split / f"{img.stem}.txt").unlink(
+                missing_ok=True)
+            removed += 1
+
+    if removed:
+        print(f"\nfinal dedupe across sources: removed {removed} duplicate "
+              f"images ({straddles} were split across train/val)")
+    else:
+        print("\nfinal dedupe: no cross-source duplicates")
+
+
+def _ingest_clean_frames(clean: list[Path], neg_ratio: float) -> None:
+    """Adds RDD2022's damage-free frames as negatives, capped by ratio.
+
+    These are the most valuable thing in the RDD download. Its India split
+    annotates damage-free road explicitly -- 3,921 of 7,706 annotated images
+    carry zero objects, and spot-checking them shows genuine intact
+    carriageway: good asphalt, lane markings, traffic, shadows, windscreen
+    glare. That is a verified negative set on INDIAN roads, which is exactly
+    what the app's reject path needs and what no amount of Californian dashcam
+    footage would provide.
+
+    Run LAST, after every positive source, because the cap is a fraction of
+    the positives in the set. Ingesting it mid-way sized it against whatever
+    happened to have been added so far -- with the RDD import running before
+    the Roboflow one, a nominal 25% came out as 8% of the finished dataset.
+
+    Capped rather than taken wholesale: negatives past roughly a quarter of
+    the set start trading recall for precision, and recall on real potholes is
+    what this app cannot afford to lose.
+    """
+    if not clean:
+        return
+
+    positives = sum(1 for s in ("train", "val")
+                    for _ in (DATASET_DIR / "images" / s).iterdir())
+    cap = int(positives * neg_ratio)
+    take = sorted(clean, key=lambda p: p.name)[:cap]
+    print(f"\nnegatives from RDD2022's damage-free frames:")
+    print(f"    {len(clean)} available, taking {len(take)} "
+          f"({neg_ratio:.0%} of {positives} positives)")
+    if len(take) < cap:
+        print(f"    NOTE: wanted {cap}, only {len(clean)} exist -- "
+              f"that is {len(take) / max(positives, 1):.0%} of the set")
+
+    counts = {"train": 0, "val": 0}
+    for img in take:
+        split = "train" if (hash_name(img.stem) % 100) < 80 else "val"
+        stem = f"rddneg_{img.stem}"
+        shutil.copy2(img, DATASET_DIR / "images" / split /
+                     f"{stem}{img.suffix.lower()}")
+        (DATASET_DIR / "labels" / split / f"{stem}.txt").write_text(
+            "", encoding="utf-8")
+        counts[split] += 1
+    print(f"    {counts['train']} train, {counts['val']} val")
+
+
+def hash_name(s: str) -> int:
+    """Stable string hash. Python's built-in hash() is salted per process."""
+    import zlib
+    return zlib.crc32(s.encode("utf-8"))
 
 
 def _remap_rdd(root: Path) -> None:
@@ -415,6 +913,16 @@ def main() -> None:
     p.add_argument("--rdd2022", help="path to an RDD2022 YOLO export to remap")
     p.add_argument("--roboflow",
                    help="path to an unzipped Roboflow YOLOv8/YOLO11 export")
+    p.add_argument("--negatives",
+                   help="path to a directory tree of images with NO road "
+                        "damage; ingested with empty labels")
+    p.add_argument("--crack-ratio", type=float, default=1.5,
+                   help="cap crack-only images at this multiple of the "
+                        "pothole-image count when ingesting RDD2022 "
+                        "(default 1.5)")
+    p.add_argument("--negative-ratio", type=float, default=0.25,
+                   help="cap RDD2022's damage-free frames at this fraction "
+                        "of the positives in the set (default 0.25)")
     p.set_defaults(func=cmd_prepare)
 
     p = sub.add_parser("train", help="fine-tune a YOLO nano model")

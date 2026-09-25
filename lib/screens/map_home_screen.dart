@@ -18,6 +18,7 @@ import '../services/supabase_service.dart';
 import 'package:image_picker/image_picker.dart';
 
 import '../services/device_identity.dart';
+import '../widgets/app_snackbar.dart';
 import '../widgets/app_drawer.dart';
 import '../widgets/glass_action_bar.dart';
 import '../widgets/hazard_alert_banner.dart';
@@ -635,23 +636,13 @@ class _MapHomeScreenState extends State<MapHomeScreen>
       final pos = await LocationService.instance.currentPosition();
       if (!mounted) return;
       if (!_withinBounds(pos.latitude, pos.longitude)) {
-        ScaffoldMessenger.of(context)
-          ..hideCurrentSnackBar()
-          ..showSnackBar(const SnackBar(
-            content: Text('You are outside the mapped corridor.'),
-            duration: Duration(seconds: 3),
-          ));
+        showAppSnack(context, 'You are outside the mapped corridor.');
         return;
       }
       await _flyTo(LatLng(pos.latitude, pos.longitude));
     } on LocationUnavailable catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context)
-        ..hideCurrentSnackBar()
-        ..showSnackBar(SnackBar(
-          content: Text(e.message),
-          duration: const Duration(seconds: 3),
-        ));
+      showAppSnack(context, e.message, isError: true);
     }
   }
 
@@ -700,15 +691,8 @@ class _MapHomeScreenState extends State<MapHomeScreen>
       return;
     }
 
-    ScaffoldMessenger.of(context)
-      ..hideCurrentSnackBar()
-      ..showSnackBar(
-        const SnackBar(
-          content: Text('No image uploaded.'),
-          duration: Duration(seconds: 2),
-          behavior: SnackBarBehavior.floating,
-        ),
-      );
+    showAppSnack(context, 'No image uploaded.',
+        duration: const Duration(seconds: 2));
   }
 
 

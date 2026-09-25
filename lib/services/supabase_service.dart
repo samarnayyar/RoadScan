@@ -154,6 +154,7 @@ class SupabaseService {
     required SeverityClass severity,
     required HazardClass hazard,
     DateTime? capturedAt,
+    String? reviewNote,
   }) async {
     final deviceId = await DeviceIdentity.instance.id;
 
@@ -173,6 +174,12 @@ class SupabaseService {
       // When the photo was actually taken, not when it was uploaded. Sent as
       // UTC so the server is never guessing at the phone's timezone.
       'p_captured_at': (capturedAt ?? DateTime.now()).toUtc().toIso8601String(),
+      // Non-null routes the report to the human review queue instead of the
+      // map: the detector found nothing and the user is asserting damage
+      // anyway. See supabase/migrations/004_human_review.sql -- a pending pin
+      // is hidden from every read path and cannot be merged into, so an
+      // unreviewed claim carries no weight until someone approves it.
+      'p_review_note': reviewNote,
     }) as List<dynamic>;
 
     if (rows.isEmpty) {

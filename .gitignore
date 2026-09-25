@@ -35,6 +35,7 @@ android/.kotlin/
 ml/dataset/
 ml/runs/
 photos/
+rdd2022/
 *.pt
 *.onnx
 __pycache__/
