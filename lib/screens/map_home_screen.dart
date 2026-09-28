@@ -382,6 +382,32 @@ class _MapHomeScreenState extends State<MapHomeScreen>
     // path here would replay the fly-in and yank the camera off wherever the
     // user was.
     if (_cameraReady) {
+      // Coming back from the Google view, this widget was rebuilt from
+      // nothing, so the camera is at whatever initialCameraPosition said
+      // rather than where the user actually was. Put it back.
+      //
+      // Jumped, not animated: the user pressed a toggle, not a fly-to, and a
+      // two-second swoop from the corridor overview would make the switch
+      // feel like a different place rather than the same one re-skinned.
+      final h = _handoverCamera;
+      if (h != null) {
+        await c.moveCamera(
+          CameraUpdate.newCameraPosition(
+            CameraPosition(
+              target: h.target,
+              zoom: h.zoom,
+              tilt: h.tilt,
+              bearing: h.bearing,
+            ),
+          ),
+        );
+        if (mounted) {
+          setState(() {
+            _pitch = h.tilt;
+            _bearing = h.bearing;
+          });
+        }
+      }
       await _pushPins();
       await _ensureBuildings();
       return;
@@ -1239,9 +1265,10 @@ class _MapHomeScreenState extends State<MapHomeScreen>
             // launch-screen "dive in" transition stop dead the moment the map
             // appeared.
             initialCameraPosition: CameraPosition(
-              target: _area.center,
-              zoom: AppConfig.areaEntryZoom,
-              tilt: 0,
+              target: _handoverCamera?.target ?? _area.center,
+              zoom: _handoverCamera?.zoom ?? AppConfig.areaEntryZoom,
+              tilt: _handoverCamera?.tilt ?? 0,
+              bearing: _handoverCamera?.bearing ?? 0,
             ),
             onMapCreated: _onMapCreated,
             onStyleLoadedCallback: _onStyleLoaded,
@@ -1459,13 +1486,19 @@ class _MapHomeScreenState extends State<MapHomeScreen>
       drawer: AppDrawer(deviceId: _deviceId.isEmpty ? '00000000' : _deviceId),
       body: Stack(
         children: [
-          Listener(
-            behavior: HitTestBehavior.translucent,
-            onPointerDown: _onPointerDown,
-            child: _buildMap(styleUrl, kind),
-          ),
+          // One or the other, never both. Keeping the MapLibre view alive
+          // behind Google's would hold a second GL surface and a second tile
+          // pipeline for something nobody can see.
+          if (_mapMode.isGoogle)
+            _buildGoogleMap()
+          else
+            Listener(
+              behavior: HitTestBehavior.translucent,
+              onPointerDown: _onPointerDown,
+              child: _buildMap(styleUrl, kind),
+            ),
 
-          if (!_styleReady)
+          if (!_styleReady && !_mapMode.isGoogle)
             ColoredBox(
               color: c.background,
               child: const Center(child: CircularProgressIndicator()),
@@ -1505,6 +1538,20 @@ class _MapHomeScreenState extends State<MapHomeScreen>
                     ),
                   ],
                 ),
+                // The view toggle, directly under the area name and its
+                // active/high/critical counts -- the top of the reading path,
+                // where a control that changes the whole screen belongs.
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(12, 10, 12, 0),
+                  child: Center(
+                    child: MapModeSwitch(
+                      mode: _mapMode,
+                      onToggle: _toggleMapMode,
+                      enabled: _styleReady || _mapMode.isGoogle,
+                    ),
+                  ),
+                ),
+
                 if (_error != null) _ErrorBanner(message: _error!),
 
                 // The proximity warning. Sits directly under the header, on the
