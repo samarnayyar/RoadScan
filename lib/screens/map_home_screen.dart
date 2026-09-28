@@ -4,6 +4,7 @@ import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 import 'package:geolocator/geolocator.dart';
+import 'package:google_maps_flutter/google_maps_flutter.dart' as gmap;
 import 'package:maplibre_gl/maplibre_gl.dart';
 
 import '../config/app_config.dart';
@@ -25,7 +26,9 @@ import '../widgets/app_snackbar.dart';
 import '../widgets/pin_popup.dart';
 import '../widgets/app_drawer.dart';
 import '../widgets/glass_action_bar.dart';
+import '../widgets/google_map_view.dart';
 import '../widgets/hazard_alert_banner.dart';
+import '../widgets/map_mode_switch.dart';
 import '../widgets/pin_detail_sheet.dart';
 import '../widgets/pitch_control.dart';
 import '../widgets/stats_overlay.dart';
@@ -61,6 +64,17 @@ class _MapHomeScreenState extends State<MapHomeScreen>
   /// present and on the device's safe-area inset, and a hardcoded guess would
   /// drift the moment either changed.
   final GlobalKey _controlsKey = GlobalKey();
+
+  /// Which map is under the chrome. See MapMode.
+  MapMode _mapMode = MapMode.roadscan;
+
+  /// The camera the OTHER view was left at, so switching back returns to the
+  /// same place rather than resetting to the area centre.
+  ///
+  /// Held as a plain record instead of either library's CameraPosition: both
+  /// define their own, and storing one would make the field lie about which
+  /// view owns it.
+  ({LatLng target, double zoom, double tilt, double bearing})? _handoverCamera;
 
   HazardReport? _selectedPin;
 
@@ -1110,6 +1124,89 @@ class _MapHomeScreenState extends State<MapHomeScreen>
 
   /// Built exactly once. Theme changes go through [_syncStyle], never through
   /// a rebuild -- see [_builtStyle].
+  /// Swaps the map under the chrome, carrying the camera across.
+  ///
+  /// The point of the switch is that it is the SAME place in a different
+  /// skin, so the camera has to travel with it. The outgoing view's position
+  /// is captured here and handed to the incoming one; MapLibre's is read
+  /// straight off the controller, Google's arrives through its camera-idle
+  /// callback and is already stored.
+  ///
+  /// The open hazard card is closed on the way through. Its position is
+  /// anchored to a pin's screen coordinates in the view being torn down, so
+  /// leaving it up would park it over a map that has moved beneath it.
+  void _toggleMapMode() {
+    if (!mounted) return;
+
+    if (_mapMode == MapMode.roadscan) {
+      final cam = _controller?.cameraPosition;
+      if (cam != null) {
+        _handoverCamera = (
+          target: cam.target,
+          zoom: cam.zoom,
+          tilt: cam.tilt,
+          bearing: cam.bearing,
+        );
+      }
+    }
+
+    setState(() {
+      _mapMode = _mapMode.other;
+      _selectedPin = null;
+      _pinAnchor = null;
+    });
+  }
+
+  /// The camera the incoming view should open at.
+  ///
+  /// Falls back to the chosen area rather than to nothing, which is what
+  /// happens on the very first switch before either view has reported a
+  /// position.
+  gmap.CameraPosition get _googleCamera {
+    final h = _handoverCamera;
+    return gmap.CameraPosition(
+      target: gmap.LatLng(
+        h?.target.latitude ?? _area.center.latitude,
+        h?.target.longitude ?? _area.center.longitude,
+      ),
+      zoom: h?.zoom ?? _area.zoom,
+      tilt: h?.tilt ?? _pitch,
+      bearing: h?.bearing ?? _bearing,
+    );
+  }
+
+  /// Stores Google's camera so the MapLibre view can be restored to it.
+  ///
+  /// MapLibre is not moved here, only recorded. It is not in the tree while
+  /// this view is open, so its controller is gone; the position is applied on
+  /// the way back, in _onStyleLoaded's camera setup.
+  void _onGoogleCameraIdle(gmap.CameraPosition cam) {
+    _handoverCamera = (
+      target: LatLng(cam.target.latitude, cam.target.longitude),
+      zoom: cam.zoom,
+      tilt: cam.tilt,
+      bearing: cam.bearing,
+    );
+  }
+
+  /// Google's map, wired to the same reports and the same card.
+  Widget _buildGoogleMap() {
+    return GoogleMapView(
+      initialCamera: _googleCamera,
+      reports: _reports,
+      onCameraIdle: _onGoogleCameraIdle,
+      onHazardTapped: (r) {
+        if (!mounted) return;
+        // No screen anchor: the card's tail is positioned from MapLibre's
+        // toScreenLocation, which does not exist here. It falls back to a
+        // plain sheet, which is the honest thing to show rather than a tail
+        // pointing at a guess.
+        showPinDetailSheet(context, report: r, onChanged: _refreshPins);
+      },
+      onMapTapped: () {},
+    );
+  }
+
   Widget _buildMap(String styleUrl, AppThemeKind kind) {
     if (_mapWidget != null) return _mapWidget!;
 
