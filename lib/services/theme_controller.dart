@@ -45,8 +45,10 @@ enum AppThemeKind {
 /// one piece of global UI state, and adding Provider/Riverpod for it would be
 /// more framework than the problem deserves.
 ///
-/// Starts on [AppThemeKind.dark] -- the app's own identity is dark, and it is
-/// the look the map was designed against.
+/// Starts on [AppThemeKind.light] until the user picks otherwise. Dark is the
+/// app's own identity, but a first launch in daylight -- which is when anyone
+/// is actually out photographing a road -- reads better light, and the stored
+/// preference takes over from the second launch onward.
 class ThemeController {
   ThemeController._();
   static final ThemeController instance = ThemeController._();
@@ -54,7 +56,7 @@ class ThemeController {
   static const _key = 'roadscan.theme_mode';
 
   final ValueNotifier<AppThemeKind> kind =
-      ValueNotifier(AppThemeKind.dark);
+      ValueNotifier(AppThemeKind.light);
 
   AppThemeKind get value => kind.value;
 

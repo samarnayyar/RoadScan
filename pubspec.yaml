@@ -21,6 +21,12 @@ dependencies:
   # final-year demo on.
   maplibre_gl: ^0.27.1
 
+  # Google's own map, offered as a second view alongside the MapLibre one --
+  # not a replacement. MapLibre draws the 3D hazard craters (fill-extrusion,
+  # no key, no quota); Google answers "what does this junction actually look
+  # like", which vector tiles cannot. See MapMode in map_home_screen.
+  google_maps_flutter: ^2.9.0
+
   # --- Backend -------------------------------------------------------------
   supabase_flutter: ^2.8.0
 

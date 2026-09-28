@@ -18,6 +18,12 @@
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher">
+        <!-- Google Maps SDK key. The value comes from `maps.apiKey` in
+             android/local.properties, which is gitignored; see the
+             manifestPlaceholders block in app/build.gradle.kts. -->
+        <meta-data
+            android:name="com.google.android.geo.API_KEY"
+            android:value="${MAPS_API_KEY}" />
         <activity
             android:name=".MainActivity"
             android:exported="true"

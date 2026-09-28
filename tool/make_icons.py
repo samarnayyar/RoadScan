@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Generate the app icons and the in-app logo asset from logo.jpg.
+Generate the app icons and the in-app logo asset from rdscan.jpg.
 
     python tool/make_icons.py
 
@@ -40,7 +40,7 @@ except ImportError:  # pragma: no cover
     raise SystemExit(1)
 
 ROOT = Path(__file__).resolve().parent.parent
-SRC = ROOT / "outside-logo.jpeg"
+SRC = ROOT / "rdscan.jpg"
 WORDMARK_SRC = ROOT / "roadscan-nobg.png"
 
 # The wordmark ships as white "ROAD" + green "SCAN" on transparency, which is

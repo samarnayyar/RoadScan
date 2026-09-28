@@ -40,7 +40,7 @@ class HazardAlertBanner extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final critical = report.severity == SeverityClass.critical;
-    final accent = critical ? const Color(0xFFD32F2F) : const Color(0xFFE2661C);
+    final accent = HazardReport.severityColor(report.severity);
 
     return Dismissible(
       key: ValueKey('alert-${report.id}'),
@@ -50,101 +50,151 @@ class HazardAlertBanner extends StatelessWidget {
         color: Colors.transparent,
         child: InkWell(
           onTap: onTap,
-          borderRadius: BorderRadius.circular(14),
+          borderRadius: BorderRadius.circular(18),
           child: Container(
             decoration: BoxDecoration(
-              color: const Color(0xFF15202B),
-              borderRadius: BorderRadius.circular(14),
-              // Thick left bar: the eye lands on the severity colour before it
-              // reads any text.
-              border: Border(left: BorderSide(color: accent, width: 6)),
-              boxShadow: const [
+              color: const Color(0xFF111C26),
+              borderRadius: BorderRadius.circular(18),
+              border: Border.all(color: accent, width: 2),
+              boxShadow: [
+                // Tinted rather than black: the glow reads as the hazard
+                // colour spilling off the card, which is what makes it catch
+                // the eye in peripheral vision while the road has attention.
                 BoxShadow(
-                    color: Color(0x40000000),
-                    blurRadius: 16,
-                    offset: Offset(0, 4)),
+                  color: accent.withValues(alpha: 0.35),
+                  blurRadius: 26,
+                  offset: const Offset(0, 6),
+                ),
               ],
             ),
-            padding: const EdgeInsets.fromLTRB(12, 11, 10, 11),
-            child: Row(
-              crossAxisAlignment: CrossAxisAlignment.center,
+            // Dark in every theme, on purpose. This is the one element that
+            // has to be read in a glance while moving, and a light card that
+            // matched the map would compete with it instead of interrupting.
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    mainAxisSize: MainAxisSize.min,
+                _distanceStrip(accent, critical),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(14, 12, 12, 13),
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.center,
                     children: [
-                      Row(
-                        children: [
-                          Icon(Icons.warning_amber_rounded,
-                              color: accent, size: 17),
-                          const SizedBox(width: 5),
-                          Text(
-                            distanceLabel(distanceMeters).toUpperCase(),
-                            style: TextStyle(
-                              color: accent,
-                              fontSize: 12,
-                              fontWeight: FontWeight.w800,
-                              letterSpacing: 0.4,
-                            ),
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 3),
-                      Text(
-                        critical
-                            ? 'Severe ${report.hazard.label.toLowerCase()} ahead'
-                            : '${report.hazard.label} ahead',
-                        style: const TextStyle(
-                          color: Colors.white,
-                          fontSize: 15,
-                          fontWeight: FontWeight.w700,
-                        ),
-                      ),
-                      const SizedBox(height: 2),
-                      Text(
-                        '${report.severity.name} severity  -  '
-                        '${report.confirmationCount} report'
-                        '${report.confirmationCount == 1 ? '' : 's'}',
-                        style: const TextStyle(
-                          color: Color(0xFF8FA3B5),
-                          fontSize: 11.5,
-                        ),
-                      ),
+                      Expanded(child: _body(critical)),
+                      if (thumbnailUrl != null) ...[
+                        const SizedBox(width: 12),
+                        _thumb(),
+                      ],
                     ],
                   ),
-                ),
-                if (thumbnailUrl != null) ...[
-                  const SizedBox(width: 10),
-                  ClipRRect(
-                    borderRadius: BorderRadius.circular(8),
-                    child: Image.network(
-                      thumbnailUrl!,
-                      width: 58,
-                      height: 58,
-                      fit: BoxFit.cover,
-                      // A broken image must never blank the warning, so fall
-                      // back to a plain tile rather than an error widget.
-                      errorBuilder: (_, __, ___) => Container(
-                        width: 58,
-                        height: 58,
-                        color: const Color(0xFF22394D),
-                        child: const Icon(Icons.image_not_supported_outlined,
-                            size: 18, color: Color(0xFF5E7386)),
-                      ),
-                    ),
-                  ),
-                ],
-                IconButton(
-                  onPressed: onDismiss,
-                  icon: const Icon(Icons.close,
-                      size: 18, color: Color(0xFF5E7386)),
-                  visualDensity: VisualDensity.compact,
-                  tooltip: 'Dismiss',
                 ),
               ],
             ),
           ),
+        ),
+      ),
+    );
+  }
+
+  /// The distance, given its own full-width band in the severity colour.
+  ///
+  /// It is the only part of this that changes second to second, and the only
+  /// part that decides what the rider does next. Big enough to read without
+  /// focusing on the phone.
+  Widget _distanceStrip(Color accent, bool critical) {
+    return Container(
+      decoration: BoxDecoration(
+        color: accent,
+        borderRadius: const BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      padding: const EdgeInsets.fromLTRB(14, 8, 8, 8),
+      child: Row(
+        children: [
+          Icon(
+            critical
+                ? Icons.dangerous_rounded
+                : Icons.warning_amber_rounded,
+            color: Colors.white,
+            size: 24,
+          ),
+          const SizedBox(width: 9),
+          Expanded(
+            child: Text(
+              distanceLabel(distanceMeters).toUpperCase(),
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 20,
+                fontWeight: FontWeight.w900,
+                letterSpacing: 0.6,
+              ),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+          SizedBox(
+            width: 34,
+            height: 30,
+            child: IconButton(
+              onPressed: onDismiss,
+              padding: EdgeInsets.zero,
+              visualDensity: VisualDensity.compact,
+              tooltip: 'Dismiss',
+              icon: const Icon(Icons.close, size: 20, color: Colors.white),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _body(bool critical) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text(
+          critical ? 'Severe damage ahead' : 'Damage ahead',
+          style: const TextStyle(
+            color: Colors.white,
+            fontSize: 17,
+            fontWeight: FontWeight.w800,
+          ),
+        ),
+        const SizedBox(height: 4),
+        Text(
+          '${report.severity.name[0].toUpperCase()}'
+          '${report.severity.name.substring(1)} severity  -  '
+          '${report.confirmationCount} report'
+          '${report.confirmationCount == 1 ? '' : 's'}',
+          style: const TextStyle(color: Color(0xFF9DB2C4), fontSize: 13),
+        ),
+        if (report.hasFootprint) ...[
+          const SizedBox(height: 3),
+          Text(
+            'About ${report.widthM!.toStringAsFixed(1)} m across',
+            style: const TextStyle(color: Color(0xFF9DB2C4), fontSize: 13),
+          ),
+        ],
+      ],
+    );
+  }
+
+  Widget _thumb() {
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(10),
+      child: Image.network(
+        thumbnailUrl!,
+        width: 84,
+        height: 72,
+        fit: BoxFit.cover,
+        // A broken image must never blank the warning, so fall back to a
+        // plain tile rather than an error widget.
+        errorBuilder: (_, __, ___) => Container(
+          width: 84,
+          height: 72,
+          color: const Color(0xFF22394D),
+          child: const Icon(Icons.image_not_supported_outlined,
+              size: 20, color: Color(0xFF5E7386)),
         ),
       ),
     );

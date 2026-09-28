@@ -406,9 +406,19 @@ insert into storage.buckets (id, name, public)
 values ('hazard-photos', 'hazard-photos', true)
 on conflict (id) do nothing;
 
+-- NO select policy here, deliberately. See migrations/008.
+--
+-- SELECT on storage.objects is what permits LISTING the bucket, which is a
+-- different thing from fetching an object you already have the path of.
+-- Fetching is governed by the bucket's `public` flag and bypasses RLS, so
+-- thumbnails resolve without it. Granting SELECT as well let anyone with the
+-- publishable key enumerate every uploaded photo -- verified returning HTTP
+-- 200 with names and timestamps on the live project.
+--
+-- The app never lists: it only calls getPublicUrl (a client-side string
+-- builder) and uploadBinary. Adding a select policy back here would reopen
+-- the hole for nothing.
 drop policy if exists hazard_photos_read on storage.objects;
-create policy hazard_photos_read on storage.objects
-  for select to anon, authenticated using (bucket_id = 'hazard-photos');
 
 drop policy if exists hazard_photos_insert on storage.objects;
 create policy hazard_photos_insert on storage.objects

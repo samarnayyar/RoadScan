@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -32,6 +34,26 @@ android {
         // flag during build.
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+
+        // Google Maps key, read from android/local.properties -- which is
+        // gitignored -- and injected into the manifest.
+        //
+        // It cannot come through --dart-define like the Supabase values do:
+        // the Maps SDK reads its key from AndroidManifest meta-data at
+        // startup, long before any Dart runs, so it has to be a build-time
+        // manifest placeholder. Putting it in the manifest directly would
+        // commit a live key to the repository.
+        //
+        // Absent, the placeholder resolves empty and the Google view renders
+        // a blank grey tile while the rest of the app works normally. That is
+        // the right failure: a missing key is a setup step, not a crash.
+        val localProps = Properties()
+        val localPropsFile = rootProject.file("local.properties")
+        if (localPropsFile.exists()) {
+            localPropsFile.inputStream().use { localProps.load(it) }
+        }
+        manifestPlaceholders["MAPS_API_KEY"] =
+            localProps.getProperty("maps.apiKey") ?: ""
     }
 
     buildTypes {

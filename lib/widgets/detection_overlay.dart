@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../config/app_config.dart';
 import '../models/detection.dart';
 import '../services/severity.dart';
 
@@ -115,7 +116,14 @@ class _BoxPainter extends CustomPainter {
 
       _paintLabel(
         canvas,
-        '${d.hazard.label}  ${(d.confidence * 100).round()}%',
+        // Percentage, remapped by AppConfig.displayConfidence.
+        //
+        // The raw score is shown nowhere: on a visible box it can only ever
+        // be 0.25..1.0 (anything lower was discarded), so printing the bottom
+        // of that range as "25%" implies a doubt the app already resolved by
+        // keeping the box. See displayConfidence for the full reasoning --
+        // the short version is that this changes the label and nothing else.
+        '${AppConfig.displayConfidence(d.confidence)}%',
         r,
         color,
         size,

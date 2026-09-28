@@ -1,3 +1,5 @@
+import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
 import 'package:maplibre_gl/maplibre_gl.dart';
 
@@ -42,23 +44,99 @@ class _AdjustLocationScreenState extends State<AdjustLocationScreen> {
   void _onCameraIdle() {
     final target = _controller?.cameraPosition?.target;
     if (target == null) return;
+
+    // Pull the pin back onto the circle if it escaped.
+    //
+    // cameraTargetBounds takes a SQUARE, so on its own it permits the corners
+    // -- 100 m x sqrt(2), about 141 m diagonally -- which sit outside the
+    // circle drawn on screen. The clamp and the picture disagreed, and the
+    // picture is the promise. This enforces the circle the user can actually
+    // see. The square bounds stay as the cheap first line of defence: they
+    // stop the fling during the gesture, and this only has to tidy up the
+    // corners afterwards.
+    final radius = AppConfig.locationAdjustRadiusMeters;
+    if (_metresFromInitial(target) > radius) {
+      final clamped = _clampToRadius(target, radius);
+      setState(() {
+        _current = clamped;
+        _moving = false;
+        _moved = true;
+      });
+      _controller?.animateCamera(
+        CameraUpdate.newLatLng(clamped),
+        duration: const Duration(milliseconds: 220),
+      );
+      return;
+    }
+
     setState(() {
       _current = target;
       _moving = false;
       // Track whether the user actually changed anything, so we can report the
       // final position's provenance honestly.
-      if (_distanceFromInitial(target) > 2) _moved = true;
+      if (_metresFromInitial(target) > 2) _moved = true;
     });
   }
 
-  double _distanceFromInitial(LatLng p) {
-    // Rough metres; only used to decide "did this move at all".
+  /// The nearest point on the allowed circle to [p].
+  ///
+  /// Scaling happens in METRES, then converts back to degrees, because a
+  /// degree of longitude is shorter than a degree of latitude everywhere but
+  /// the equator. Normalising the raw degree offsets would put the clamped
+  /// point off the circle it is supposed to land on, worst at the diagonals.
+  LatLng _clampToRadius(LatLng p, double radius) {
     const mPerDegLat = 111320.0;
+    final cosLat = math.cos(widget.initial.latitude * math.pi / 180.0);
+    final safeCos = cosLat.abs() < 0.01 ? 0.01 : cosLat;
+
+    final dLatM = (p.latitude - widget.initial.latitude) * mPerDegLat;
+    final dLonM =
+        (p.longitude - widget.initial.longitude) * mPerDegLat * safeCos;
+    final dist = math.sqrt(dLatM * dLatM + dLonM * dLonM);
+    if (dist <= radius || dist == 0) return p;
+
+    final k = radius / dist;
+    return LatLng(
+      widget.initial.latitude + (dLatM * k) / mPerDegLat,
+      widget.initial.longitude + (dLonM * k) / (mPerDegLat * safeCos),
+    );
+  }
+
+  /// A square of +/- [metres] around [centre], for the camera clamp.
+  ///
+  /// Longitude degrees shrink with latitude, so the longitude span is widened
+  /// by 1/cos(lat). Using the same delta for both axes would give a box that
+  /// is 50 m tall but only ~43 m wide at Dehradun's latitude -- a clamp that
+  /// is tighter east-west than north-south for no reason anyone could guess.
+  static LatLngBounds _boundsAround(LatLng centre, double metres) {
+    const mPerDegLat = 111320.0;
+    final dLat = metres / mPerDegLat;
+    final cosLat = math.cos(centre.latitude * math.pi / 180.0);
+    final dLon = metres / (mPerDegLat * (cosLat.abs() < 0.01 ? 0.01 : cosLat));
+    return LatLngBounds(
+      southwest: LatLng(centre.latitude - dLat, centre.longitude - dLon),
+      northeast: LatLng(centre.latitude + dLat, centre.longitude + dLon),
+    );
+  }
+
+  /// Metres between [p] and where the photo said it was taken.
+  ///
+  /// Proper Euclidean distance. The previous version computed the squared sum
+  /// only to test it against zero and then returned |dLat| + |dLon| -- a
+  /// Manhattan distance, which overstates by up to sqrt(2) on the diagonals.
+  /// Harmless while it only answered "did this move at all"; not harmless now
+  /// that it decides whether a pin is inside the allowed circle.
+  ///
+  /// cos(latitude) is computed rather than the hardcoded 0.86 it used before.
+  /// That constant is right for about 30.5 degrees and wrong everywhere else,
+  /// which is a trap for anyone who reuses this screen outside Dehradun.
+  double _metresFromInitial(LatLng p) {
+    const mPerDegLat = 111320.0;
+    final cosLat = math.cos(widget.initial.latitude * math.pi / 180.0);
     final dLat = (p.latitude - widget.initial.latitude) * mPerDegLat;
-    final dLon = (p.longitude - widget.initial.longitude) * mPerDegLat * 0.86;
-    return (dLat * dLat + dLon * dLon) > 0
-        ? (dLat.abs() + dLon.abs())
-        : 0;
+    final dLon =
+        (p.longitude - widget.initial.longitude) * mPerDegLat * cosLat;
+    return math.sqrt(dLat * dLat + dLon * dLon);
   }
 
   @override
@@ -84,12 +162,58 @@ class _AdjustLocationScreenState extends State<AdjustLocationScreen> {
             styleString: AppConfig.mapStyleUrl,
             initialCameraPosition: CameraPosition(
               target: widget.initial,
-              // Close in hard: at z18 a screen pixel is ~0.3 m, so the user can
-              // actually place the pin on a specific pothole rather than a
-              // general stretch of road.
-              zoom: 18.5,
-              tilt: 0,
+              // Opens showing the WHOLE allowed circle, then the user zooms
+              // in to place precisely.
+              //
+              // Measured at this latitude: 18.5 was ~0.36 m per logical
+              // pixel, about 175 m across the screen -- narrower than the
+              // 200 m circle, so the boundary sat off-screen at the exact
+              // moment the user needed to understand it. Being stopped by a
+              // limit you cannot see reads as the app being broken. 17.5 is
+              // ~0.73 m/px, about 350 m across, so the whole circle fits with
+              // room to spare and the rule explains itself on arrival.
+              //
+              // Zooming in is still available up to z20 (minMaxZoomPreference
+              // below), which is where the fine placement actually happens.
+              zoom: 17.5,
+              // Pitched, matching the main map so the two read as the same
+              // place rather than two different products.
+              //
+              // The trade-off is real and worth stating: a pitched view makes
+              // it harder to judge exactly which bit of road the centre pin
+              // sits over, because the ground plane is foreshortened toward
+              // the top of the screen. The pin still resolves to a genuine
+              // ground point -- cameraPosition.target is where screen centre
+              // meets the ground -- so placement stays correct; it is only
+              // eyeballing it that gets harder -- which is why this is 30
+              // and not the main map's 45: enough tilt to read as the same
+              // place, little enough that the ground stays judgeable.
+              tilt: 30,
             ),
+            // Confined to a square around where the photo says it was taken.
+            //
+            // MapLibre's camera clamp is RECTANGULAR -- there is no circular
+            // equivalent -- so this square is the coarse limit and the circle
+            // is enforced by _onCameraIdle pulling the pin back onto it. The
+            // consequence is honest and visible: near the diagonals you can
+            // drag slightly past the drawn edge and it springs back when you
+            // let go, rather than being blocked mid-gesture. Shrinking the
+            // square to fit inside the circle would prevent that, but would
+            // also make the circle a lie in the other direction -- its north,
+            // south, east and west edges would become unreachable at ~71 m
+            // instead of the stated 100 m.
+            //
+            // Without a clamp this is a whole-world map: one careless fling
+            // and the pin is in another district, which the app would then
+            // file as a real hazard because nothing downstream re-checks it.
+            // 50 m is wider than consumer GPS error (typically 5-10 m) so a
+            // genuine correction always fits, while a gross relocation cannot
+            // happen by accident. Someone whose photo is truly further out
+            // than this should retake it rather than drag it across town.
+            cameraTargetBounds: CameraTargetBounds(_boundsAround(
+              widget.initial,
+              AppConfig.locationAdjustRadiusMeters,
+            )),
             onMapCreated: (c) => _controller = c,
             onStyleLoadedCallback: () async {
               // Same bundled footprints as the main map, not the basemap's
@@ -102,13 +226,37 @@ class _AdjustLocationScreenState extends State<AdjustLocationScreen> {
               } catch (_) {
                 /* buildings are an orientation aid here, not essential */
               }
+
+              // The drag limit, drawn. Same hatch-and-dim language as the
+              // corridor square on the main map, so it reads as "not here"
+              // without needing a caption. Without it the clamp is invisible
+              // until the map stops responding, which feels like a bug.
+              try {
+                String? hatchId;
+                final hatch = await MapLayers.makeHatchImage();
+                if (hatch != null) {
+                  hatchId = 'roadscan-hatch';
+                  await _controller!.addImage(hatchId, hatch);
+                }
+                await MapLayers.addRadiusMask(
+                  _controller!,
+                  centre: widget.initial,
+                  radiusMeters: AppConfig.locationAdjustRadiusMeters,
+                  hatchImageId: hatchId,
+                );
+              } catch (e) {
+                // The camera clamp is the real restriction; this only shows
+                // where it is. Losing it must not lose the screen.
+                debugPrint('RoadScan: radius mask unavailable: $e');
+              }
             },
             onCameraIdle: _onCameraIdle,
             onCameraTrackingDismissed: () => setState(() => _moving = true),
             myLocationEnabled: true,
             trackCameraPosition: true,
-            // Flat and north-up: tilt would make it much harder to judge
-            // exactly which bit of road the pin is over.
+            // Pitch is fixed at 30: the user cannot flatten it or tip it
+            // further, so every placement is judged from the same viewpoint
+            // and two reports of the same pothole are comparable.
             tiltGesturesEnabled: false,
             rotateGesturesEnabled: false,
             minMaxZoomPreference: const MinMaxZoomPreference(15, 20),

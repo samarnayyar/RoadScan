@@ -78,6 +78,52 @@ class SupabaseService {
   bool get isConfigured => AppConfig.hasSupabaseCredentials;
 
   // ---------------------------------------------------------------------------
+  // Live updates
+  // ---------------------------------------------------------------------------
+
+  RealtimeChannel? _hazardChannel;
+
+  /// Calls [onChanged] whenever any device adds or updates a hazard report.
+  ///
+  /// The callback gets NO payload, deliberately. A realtime event here means
+  /// "something changed, refetch" -- it is not the pin.
+  ///
+  /// The replicated row is the raw hazard_reports record, which is not what
+  /// the map draws. The map needs confidence decayed to now, the derived
+  /// status, the photo count and newest photo path, and it must exclude
+  /// anything still in review_state = 'pending'. A client that painted the
+  /// raw row would show unvetted reports at stale confidence. Refetching
+  /// through nearby_reports keeps one definition of "what belongs on the map"
+  /// and leaves it on the server.
+  ///
+  /// Cheap to do this way too: the events are rare (a report every few
+  /// minutes at most), so the extra round trip costs nothing that matters,
+  /// while a payload-driven path would need the decay and filter rules
+  /// duplicated in Dart and kept in sync with the SQL forever.
+  void subscribeToHazards(void Function() onChanged) {
+    if (!isConfigured || _hazardChannel != null) return;
+
+    _hazardChannel = _db
+        .channel('public:hazard_reports')
+        .onPostgresChanges(
+          // Insert AND update: a new pothole is an insert, but a second rider
+          // confirming an existing one is an update, and that changes the
+          // pin's confidence and confirmation count on everyone's map.
+          event: PostgresChangeEvent.all,
+          schema: 'public',
+          table: 'hazard_reports',
+          callback: (_) => onChanged(),
+        )
+        .subscribe();
+  }
+
+  Future<void> unsubscribeFromHazards() async {
+    final ch = _hazardChannel;
+    _hazardChannel = null;
+    if (ch != null) await _db.removeChannel(ch);
+  }
+
+  // ---------------------------------------------------------------------------
   // Reads
   // ---------------------------------------------------------------------------
 
@@ -155,6 +201,8 @@ class SupabaseService {
     required HazardClass hazard,
     DateTime? capturedAt,
     String? reviewNote,
+    double? widthM,
+    double? lengthM,
   }) async {
     final deviceId = await DeviceIdentity.instance.id;
 
@@ -180,6 +228,11 @@ class SupabaseService {
       // is hidden from every read path and cannot be merged into, so an
       // unreviewed claim carries no weight until someone approves it.
       'p_review_note': reviewNote,
+      // Estimated ground size, so every device draws this hazard at the same
+      // scale. Null when the estimator declined the geometry -- the server
+      // stores null rather than guessing.
+      'p_width_m': widthM,
+      'p_length_m': lengthM,
     }) as List<dynamic>;
 
     if (rows.isEmpty) {

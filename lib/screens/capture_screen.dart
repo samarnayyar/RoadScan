@@ -8,6 +8,7 @@ import '../services/theme_controller.dart' show AppThemeKind;
 import '../models/detection.dart';
 import '../models/review_verdict.dart';
 import '../services/detection_service.dart';
+import '../services/ground_footprint.dart';
 import '../services/location_service.dart';
 import '../services/photo_metadata.dart';
 import '../services/severity.dart';
@@ -304,6 +305,15 @@ class _CaptureScreenState extends State<CaptureScreen> {
       _error = null;
     });
 
+    // The worst detection is what the severity band came from, so it is also
+    // the one whose ground size the map should draw. Null is an acceptable
+    // outcome -- see GroundFootprint.estimate, which declines boxes whose
+    // rays never meet the road plane or that sit too near the horizon.
+    final driver = result.driver;
+    final footprint = driver == null
+        ? null
+        : GroundFootprint.estimate(driver, meta.aspectRatio);
+
     try {
       final outcome = await SupabaseService.instance.submitReport(
         photo: meta.file,
@@ -314,6 +324,12 @@ class _CaptureScreenState extends State<CaptureScreen> {
         hazard: result.isEmpty ? HazardClass.pothole : result.hazard,
         capturedAt: meta.capturedAt,
         reviewNote: reviewNote,
+        // Estimated from the box that drove the verdict, against this photo's
+        // own aspect ratio. Computed here rather than on the map because the
+        // detection box does not survive upload -- the map only ever receives
+        // a coordinate and a storage path.
+        widthM: footprint?.widthM,
+        lengthM: footprint?.lengthM,
       );
 
       if (!mounted) return;
@@ -380,7 +396,25 @@ class _CaptureScreenState extends State<CaptureScreen> {
       child: Stack(
         fit: StackFit.expand,
         children: [
-          Image.file(meta.file, fit: BoxFit.contain),
+          // width/height forced to infinity, and Positioned.fill, rather than
+          // relying on StackFit.expand alone.
+          //
+          // Measured on device: the photo was drawing at 864x431 inside a
+          // 1440x1660 preview -- 60% of the available width -- when
+          // BoxFit.contain should have spanned the full width and letterboxed
+          // vertically. The image was evidently sizing to something other
+          // than the box. Stating the size explicitly removes the ambiguity
+          // instead of depending on constraints propagating through
+          // Container -> Stack -> child exactly as expected.
+          Positioned.fill(
+            child: Image.file(
+              meta.file,
+              fit: BoxFit.contain,
+              width: double.infinity,
+              height: double.infinity,
+              filterQuality: FilterQuality.medium,
+            ),
+          ),
           if (result != null && result.detections.isNotEmpty)
             DetectionOverlay(
               detections: result.detections,
@@ -650,12 +684,31 @@ class _MetadataRow extends StatelessWidget {
   }
 }
 
+/// The verdict line: what it is, how bad, and why.
+///
+/// Rewritten because the old version put two unrelated numbers side by side
+/// and let the user infer a relationship that does not exist:
+///
+///   "Pothole - HIGH   score 0.68 - 4 found"
+///
+/// next to boxes labelled "58%". Those measure different things. The box
+/// percentage is DETECTION CONFIDENCE -- how sure the model is that the thing
+/// in the box is a pothole at all. The severity band is a SIZE measure, taken
+/// from the fraction of the frame the worst single defect covers (see
+/// Severity.scoreForArea: <2% low, 2-8% medium, 8-20% high, >20% critical).
+/// A 58% box can be CRITICAL and a 95% box can be LOW.
+///
+/// The raw 0..1 score is dropped. It was the internal representation leaking
+/// into the UI -- nobody outside the code knows what 0.68 is out of, and the
+/// band name already carries that meaning. The frame percentage replaces it
+/// because it states the actual evidence the band was derived from.
 class _SeverityChip extends StatelessWidget {
   const _SeverityChip({required this.result});
   final SeverityResult result;
 
   @override
   Widget build(BuildContext context) {
+    final c = context.rs;
     final color = switch (result.severity) {
       SeverityClass.low => const Color(0xFF3FA34D),
       SeverityClass.medium => const Color(0xFFE8B21A),
@@ -663,28 +716,62 @@ class _SeverityChip extends StatelessWidget {
       SeverityClass.critical => const Color(0xFFD32F2F),
     };
 
-    return Row(
+    final n = result.detections.length;
+    final areaPct = ((result.driver?.areaRatio ?? 0) * 100);
+    // Below 1% the rounded figure reads "0% of photo", which looks like a bug
+    // rather than a small defect.
+    final areaText =
+        areaPct < 1 ? '<1%' : '${areaPct.round()}%';
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Container(
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
-          decoration: BoxDecoration(
-            color: color,
-            borderRadius: BorderRadius.circular(20),
-          ),
-          child: Text(
-            '${result.hazard.label} - ${result.severity.name.toUpperCase()}',
-            style: const TextStyle(
-              color: Colors.white,
-              fontWeight: FontWeight.w700,
-              fontSize: 12.5,
+        Row(
+          children: [
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+              decoration: BoxDecoration(
+                color: color,
+                borderRadius: BorderRadius.circular(20),
+              ),
+              child: Text(
+                '${result.hazard.label.toUpperCase()}  '
+                '·  ${result.severity.name.toUpperCase()}',
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontWeight: FontWeight.w700,
+                  fontSize: 12.5,
+                ),
+              ),
             ),
-          ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Text(
+                n == 1 ? '1 found' : '$n found',
+                style: TextStyle(color: c.textSecondary, fontSize: 12),
+              ),
+            ),
+          ],
         ),
-        const SizedBox(width: 10),
+        const SizedBox(height: 6),
+        // States the evidence, not the internal score. "Worst" matters: the
+        // band comes from the single largest defect, never from their sum --
+        // a mesh of hairline cracks must not outrank one axle-breaking hole.
+        // Both lines kept SHORT enough to fit one line at this width, and
+        // both in textSecondary. The second was textMuted and ran to three
+        // wrapped lines, which made the one sentence that resolves the
+        // confidence-vs-severity confusion the faintest thing on the screen.
         Text(
-          'score ${result.score.toStringAsFixed(2)}  -  '
-          '${result.detections.length} found',
-          style: TextStyle(color: context.rs.textSecondary, fontSize: 12),
+          'Severity from size: worst defect covers $areaText of photo',
+          style: TextStyle(color: c.textSecondary, fontSize: 10.5, height: 1.35),
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+        ),
+        Text(
+          'Box % = how sure the detector is, not how bad the damage is',
+          style: TextStyle(color: c.textSecondary, fontSize: 10.5, height: 1.35),
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
         ),
       ],
     );

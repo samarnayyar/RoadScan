@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
@@ -8,6 +9,8 @@ import 'package:maplibre_gl/maplibre_gl.dart';
 
 import '../models/detection.dart';
 import '../models/hazard_report.dart';
+import 'hazard_zone.dart';
+import 'pin_icons.dart';
 import 'app_config.dart';
 
 /// Builds the style layers RoadScan adds on top of the base map, and the
@@ -33,7 +36,22 @@ class MapLayers {
   static const String maskFillLayerId = 'roadscan-bounds-mask-fill';
   static const String maskHatchLayerId = 'roadscan-bounds-mask-hatch';
   static const String maskEdgeLayerId = 'roadscan-bounds-edge';
+  static const String radiusSourceId = 'roadscan-radius-mask';
+  static const String radiusFillLayerId = 'roadscan-radius-mask-fill';
+  static const String radiusHatchLayerId = 'roadscan-radius-mask-hatch';
+  static const String radiusEdgeLayerId = 'roadscan-radius-edge';
   static const String pinSourceId = 'roadscan-pins';
+  /// One layer, not three.
+  ///
+  /// Pins used to be a blurred glow, a filled circle and a count label
+  /// stacked on each other. That is three draws and three things to keep in
+  /// step for every hazard, and on a corridor with real traffic it turned the
+  /// map into a field of overlapping blobs. The marker is now a single
+  /// teardrop symbol; the count and the age it used to shout live in the card
+  /// that opens when you tap it.
+  static const String pinLayerId = 'roadscan-pins-marker';
+
+  /// Retained so a style loaded by an older build still gets cleaned up.
   static const String pinGlowLayerId = 'roadscan-pins-glow';
   static const String pinCoreLayerId = 'roadscan-pins-core';
   static const String pinCountLayerId = 'roadscan-pins-count';
@@ -386,7 +404,7 @@ class MapLayers {
       // when the camera is pitched, while leaving pins, position and place
       // names clear above them.
       belowLayerId: await _firstExisting(c, const [
-        pinGlowLayerId,
+        pinLayerId,
         areaLabelLayerId,
       ]),
       enableInteraction: false,
@@ -633,6 +651,11 @@ class MapLayers {
   /// would wash out.
   static Future<void> addCorridor(MapLibreMapController c) async {
     final geo = await _corridorGeoJson();
+
+    // The hazard zones are stretches OF this route, so they are snapped
+    // against the same geometry rather than a second copy that could drift
+    // out of step with it.
+    HazardZone.loadRoutes(geo);
 
     for (final id in const [
       corridorSpurLayerId,
@@ -1124,6 +1147,130 @@ class MapLayers {
     );
   }
 
+  /// Masks everything outside a circle of [radiusMeters] around [centre].
+  ///
+  /// The circular twin of addBoundsMask, for the "Set location" screen. Same
+  /// visual language on purpose: a user who has seen the corridor square
+  /// already knows that hatched-and-dimmed means "you cannot go there", so the
+  /// drag limit explains itself instead of being discovered by the map
+  /// refusing to move.
+  ///
+  /// Built as ONE polygon with a hole rather than a filled ring: a GeoJSON
+  /// polygon's first ring is the outer boundary and every later ring is cut
+  /// out of it, so a world-sized outer ring plus the circle as an inner ring
+  /// gives exactly "everywhere except here" in a single feature.
+  static Future<void> addRadiusMask(
+    MapLibreMapController c, {
+    required LatLng centre,
+    required double radiusMeters,
+    String? hatchImageId,
+  }) async {
+    for (final id in [
+      radiusEdgeLayerId,
+      radiusHatchLayerId,
+      radiusFillLayerId,
+    ]) {
+      await _dropLayer(c, id);
+    }
+    await _dropSource(c, radiusSourceId);
+    await _dropSource(c, '$radiusSourceId-edge');
+
+    final ring = _circleRing(centre, radiusMeters);
+
+    await c.addGeoJsonSource(radiusSourceId, {
+      'type': 'FeatureCollection',
+      'features': [
+        {
+          'type': 'Feature',
+          'properties': const {},
+          'geometry': {
+            'type': 'Polygon',
+            // Outer ring is the whole world; the circle is the hole. Wound
+            // the opposite way to the outer ring, which is what marks it as
+            // a hole rather than a second filled shape.
+            'coordinates': [
+              const [
+                [-180.0, -85.0],
+                [180.0, -85.0],
+                [180.0, 85.0],
+                [-180.0, 85.0],
+                [-180.0, -85.0],
+              ],
+              ring.reversed.toList(),
+            ],
+          },
+        },
+      ],
+    });
+
+    await c.addGeoJsonSource('$radiusSourceId-edge', {
+      'type': 'FeatureCollection',
+      'features': [
+        {
+          'type': 'Feature',
+          'properties': const {},
+          'geometry': {'type': 'LineString', 'coordinates': ring},
+        },
+      ],
+    });
+
+    await c.addFillLayer(
+      radiusSourceId,
+      radiusFillLayerId,
+      const FillLayerProperties(fillColor: '#0B2A4A', fillOpacity: 0.72),
+      enableInteraction: false,
+    );
+
+    if (hatchImageId != null) {
+      await c.addFillLayer(
+        radiusSourceId,
+        radiusHatchLayerId,
+        FillLayerProperties(fillPattern: hatchImageId, fillOpacity: 0.28),
+        enableInteraction: false,
+      );
+    }
+
+    await c.addLineLayer(
+      '$radiusSourceId-edge',
+      radiusEdgeLayerId,
+      const LineLayerProperties(
+        lineColor: '#4FB8ED',
+        lineWidth: 2.0,
+        lineOpacity: 0.85,
+      ),
+      enableInteraction: false,
+    );
+  }
+
+  /// A closed ring of [lon, lat] pairs approximating a circle on the ground.
+  ///
+  /// 96 segments: at 100 m radius that is a ~6.5 m chord, well under a pixel
+  /// of error at the zoom this screen uses, and the polygon still costs
+  /// nothing to draw. Longitude is divided by cos(lat) so the shape is a
+  /// circle on the GROUND rather than in degree space, which at Dehradun's
+  /// latitude would otherwise come out visibly squashed east-west.
+  static List<List<double>> _circleRing(
+    LatLng centre,
+    double radiusMeters, {
+    int segments = 96,
+  }) {
+    const mPerDegLat = 111320.0;
+    final cosLat = math.cos(centre.latitude * math.pi / 180.0);
+    final safeCos = cosLat.abs() < 0.01 ? 0.01 : cosLat;
+    final dLat = radiusMeters / mPerDegLat;
+    final dLon = radiusMeters / (mPerDegLat * safeCos);
+
+    final ring = <List<double>>[];
+    for (var i = 0; i <= segments; i++) {
+      final t = 2 * math.pi * i / segments;
+      ring.add([
+        centre.longitude + dLon * math.cos(t),
+        centre.latitude + dLat * math.sin(t),
+      ]);
+    }
+    return ring;
+  }
+
   /// Builds a small diagonal-stripe tile to use as the mask's fill pattern.
   ///
   /// Generated at runtime rather than shipped as an asset: it is twelve lines
@@ -1180,19 +1327,14 @@ class MapLayers {
                 'id': r.id,
                 'color': _hex(r),
                 'opacity': r.markerOpacity,
+                'icon': PinIcons.nameFor(r.severity),
+                'iconSize': _iconSizeFor(r),
                 'severity': r.severity.name,
                 'hazard': r.hazard.name,
                 'confirmations': r.confirmationCount,
-                'countLabel':
-                    r.confirmationCount > 1 ? '${r.confirmationCount}' : '',
                 'isFresh': r.isFresh,
                 'isStale': r.isStale,
                 'isFixed': r.isFixed,
-                // Fixed pins shrink; critical pins grow. Size carries urgency
-                // even for a colour-blind viewer.
-                'radius': r.isFixed ? 6.0 : _radiusFor(r),
-                'strokeOpacity': r.isStale ? 0.95 : 0.65,
-                'strokeWidth': r.isStale ? 2.4 : 1.6,
               },
             },
         ],
@@ -1204,7 +1346,12 @@ class MapLayers {
   /// the layers that reference it are rebuilt, and adding a source id that
   /// already exists throws.
   static Future<void> addPinSource(MapLibreMapController c) async {
-    for (final id in [pinGlowLayerId, pinCoreLayerId, pinCountLayerId]) {
+    for (final id in [
+      pinLayerId,
+      pinGlowLayerId,
+      pinCoreLayerId,
+      pinCountLayerId,
+    ]) {
       await _dropLayer(c, id);
     }
     await _dropSource(c, pinSourceId);
@@ -1212,64 +1359,59 @@ class MapLayers {
   }
 
   static Future<void> addPinLayers(MapLibreMapController c) async {
-    for (final id in [pinGlowLayerId, pinCoreLayerId, pinCountLayerId]) {
+    for (final id in [
+      pinLayerId,
+      pinGlowLayerId,
+      pinCoreLayerId,
+      pinCountLayerId,
+    ]) {
       await _dropLayer(c, id);
     }
-    // Glow sits under the core circle and is filtered to pins under 24h old,
-    // giving fresh reports a halo that draws the eye without a new colour.
-    await c.addCircleLayer(
-      pinSourceId,
-      pinGlowLayerId,
-      CircleLayerProperties(
-        circleRadius: ['*', ['get', 'radius'], 2.2],
-        circleColor: ['get', 'color'],
-        circleOpacity: 0.28,
-        circleBlur: 0.9,
-      ),
-      filter: ['==', ['get', 'isFresh'], true],
-      enableInteraction: false,
-    );
 
-    await c.addCircleLayer(
-      pinSourceId,
-      pinCoreLayerId,
-      CircleLayerProperties(
-        circleRadius: ['get', 'radius'],
-        circleColor: ['get', 'color'],
-        circleOpacity: ['get', 'opacity'],
-        circleStrokeColor: '#FFFFFF',
-        circleStrokeWidth: ['get', 'strokeWidth'],
-        circleStrokeOpacity: ['get', 'strokeOpacity'],
-      ),
-    );
-
-    // Confirmation-count badge. Empty string for single reports so we don't
-    // stamp a "1" on every pin on the map.
     await c.addSymbolLayer(
       pinSourceId,
-      pinCountLayerId,
+      pinLayerId,
       SymbolLayerProperties(
-        textField: ['get', 'countLabel'],
-        textSize: 11.0,
-        textColor: '#FFFFFF',
-        textHaloColor: 'rgba(0,0,0,0.45)',
-        textHaloWidth: 0.8,
-        textAllowOverlap: true,
-        textIgnorePlacement: true,
-        textFont: const ['Noto Sans Regular'],
+        iconImage: ['get', 'icon'],
+        iconSize: ['*', ['get', 'iconSize'], PinIcons.iconScale],
+        // The tip is the hazard; the head hangs above it. Without this the
+        // marker would be centred on the point and the glyph would sit on
+        // top of the very thing it is marking.
+        iconAnchor: 'bottom',
+        // A hazard must not be hidden because a cafe label got there first,
+        // and two hazards close together must both stay visible -- on a
+        // corridor map the cluster IS the information.
+        iconAllowOverlap: true,
+        iconIgnorePlacement: true,
+        // Fades out as the 3D crater takes over. Zoomed out the marker is the
+        // only thing showing the hazard; zoomed in it would stand on top of
+        // the crater it is pointing at. The symbol is still rendered and
+        // still tappable at zero opacity, and the crater rim is a tap target
+        // too.
+        iconOpacity: [
+          'interpolate',
+          ['linear'],
+          ['zoom'],
+          17.8, ['get', 'opacity'],
+          18.8, 0.0,
+        ],
       ),
-      enableInteraction: false,
     );
   }
 
   /// Critical pins render larger so severity survives a glance at a tilted map
-  /// where distant pins are already small.
-  static double _radiusFor(HazardReport r) => switch (r.severity) {
-        SeverityClass.low => 7.0,
-        SeverityClass.medium => 8.5,
-        SeverityClass.high => 10.5,
-        SeverityClass.critical => 12.5,
-      };
+  /// where distant pins are already small, and so size carries urgency for a
+  /// colour-blind viewer. A pin voted fixed shrinks out of the way without
+  /// vanishing -- it is still there to be re-reported.
+  static double _iconSizeFor(HazardReport r) {
+    if (r.isFixed) return 0.72;
+    return switch (r.severity) {
+      SeverityClass.low => 0.88,
+      SeverityClass.medium => 1.0,
+      SeverityClass.high => 1.15,
+      SeverityClass.critical => 1.3,
+    };
+  }
 
   static String _hex(HazardReport r) {
     final c = r.color;

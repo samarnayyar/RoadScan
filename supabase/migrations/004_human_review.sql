@@ -73,6 +73,19 @@ create index if not exists hazard_reports_pending_review
 -- Done by replacing the two read functions rather than by adding a filter at
 -- each call site, so a future caller cannot forget it.
 -- ---------------------------------------------------------------------------
+-- The return shape below is COPIED from schema.sql, not rewritten.
+--
+-- `create or replace function` cannot change a function's return type -- it
+-- fails with "42P13: cannot change return type of existing function". The
+-- first version of this migration rebuilt the column list from memory, by
+-- analogy with all_reports, and got two things wrong: it added photo_count
+-- (which nearby_reports deliberately omits -- see the note in
+-- HazardReport.fromRpc) and it moved distance_m to the end. That is a
+-- different row type, so the migration aborted.
+--
+-- Matching exactly means no DROP is needed, which also means there is no
+-- window where the function does not exist and no chance of the client's
+-- column contract drifting. The ONLY change here is the review_state filter.
 create or replace function nearby_reports(
   p_lat      double precision,
   p_lon      double precision,
@@ -91,9 +104,8 @@ returns table (
   risk_level         text,
   created_at         timestamptz,
   last_confirmed_at  timestamptz,
-  photo_count        integer,
-  latest_photo       text,
-  distance_m         double precision
+  distance_m         double precision,
+  latest_photo       text
 )
 language sql stable as $fn$
   select
@@ -109,19 +121,18 @@ language sql stable as $fn$
     hr.risk_level,
     hr.created_at,
     hr.last_confirmed_at,
-    (select count(*)::integer from report_photos rp
-      where rp.hazard_report_id = hr.id),
+    st_distance(hr.location,
+                st_setsrid(st_makepoint(p_lon, p_lat), 4326)::geography),
     (select rp.storage_path from report_photos rp
       where rp.hazard_report_id = hr.id
-      order by rp.captured_at desc limit 1),
-    st_distance(hr.location,
-                st_setsrid(st_makepoint(p_lon, p_lat), 4326)::geography)
+      order by rp.captured_at desc limit 1)
   from hazard_reports hr
   where hr.review_state <> 'pending'
     and st_dwithin(hr.location,
                    st_setsrid(st_makepoint(p_lon, p_lat), 4326)::geography,
                    p_radius_m)
-  order by hr.location <-> st_setsrid(st_makepoint(p_lon, p_lat), 4326)::geography;
+  order by st_distance(
+    hr.location, st_setsrid(st_makepoint(p_lon, p_lat), 4326)::geography);
 $fn$;
 
 grant execute on function nearby_reports(double precision, double precision, double precision)
@@ -322,7 +333,7 @@ language sql stable as $fn$
   limit p_limit;
 $fn$;
 
--- Approve / reject, for the reviewer. Also not granted to anon.
+-- Approve / reject, for the reviewer.
 create or replace function review_decide(p_report_id uuid, p_approve boolean)
 returns void
 language sql as $fn$
@@ -332,6 +343,23 @@ language sql as $fn$
          reviewed_at  = now()
    where id = p_report_id;
 $fn$;
+
+-- MUST be revoked, not merely left ungranted.
+--
+-- CREATE FUNCTION grants EXECUTE to PUBLIC automatically, and every role is
+-- implicitly a member of PUBLIC. An earlier version of this file said these
+-- were "deliberately not granted to anon" and left it at that -- so both were
+-- callable with the publishable key that ships in the APK. review_decide sets
+-- review_state to 'approved', which is precisely what releases a quarantined
+-- pin onto the map, so anyone could have approved their own rejected photo
+-- and walked straight through the gate this migration exists to build.
+--
+-- PUBLIC first: revoking only from anon and authenticated leaves the
+-- automatic PUBLIC grant in place and achieves nothing.
+revoke all on function review_queue(integer)        from public;
+revoke all on function review_decide(uuid, boolean) from public;
+revoke all on function review_queue(integer)        from anon, authenticated;
+revoke all on function review_decide(uuid, boolean) from anon, authenticated;
 
 -- ---------------------------------------------------------------------------
 -- 5. Verify

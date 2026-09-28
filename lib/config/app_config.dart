@@ -1,3 +1,5 @@
+import 'dart:math' as math;
+
 import 'package:maplibre_gl/maplibre_gl.dart';
 
 import '../models/detection.dart' show HazardClass;
@@ -103,6 +105,31 @@ class AppConfig {
   static CampusArea areaById(String id) =>
       areas.firstWhere((a) => a.id == id, orElse: () => areas.first);
 
+  /// The corridor area closest to a point.
+  ///
+  /// Stands in for a reverse geocoder, which this app deliberately does not
+  /// have: a network call and a key to name a place, when four known landmarks
+  /// already cover every point inside the operating square. Uses flat
+  /// Pythagoras with a cosine correction on longitude -- over an 8 km corridor
+  /// the great-circle difference is centimetres, and only the RANKING matters
+  /// here anyway.
+  static CampusArea nearestAreaTo(double lat, double lon) {
+    const mPerDegLat = 111320.0;
+    final cosLat = math.cos(lat * math.pi / 180.0);
+    var best = areas.first;
+    var bestD = double.infinity;
+    for (final a in areas) {
+      final dy = (lat - a.center.latitude) * mPerDegLat;
+      final dx = (lon - a.center.longitude) * mPerDegLat * cosLat;
+      final d = dx * dx + dy * dy;
+      if (d < bestD) {
+        bestD = d;
+        best = a;
+      }
+    }
+    return best;
+  }
+
   // --------------------------------------------------------------------------
   // The operating square
   //
@@ -197,7 +224,17 @@ class AppConfig {
   /// Tilt slider. Kept SHORT, unlike the others: this one tracks a finger, and
   /// anything slower lags visibly behind the drag.
   static const Duration pitchDuration = Duration(milliseconds: 220);
-  static const double maxZoom = 19.0;
+  /// How far in the map will go.
+  ///
+  /// Raised from 19 for the 3D crater. A crater is drawn at the footprint
+  /// measured from the photo -- under a metre for a typical pothole -- which
+  /// is about seven pixels at z19: not a rendering bug, just too small to
+  /// see. It takes z21.5 for a 0.9 m hole to be forty pixels across. The
+  /// vector tiles have no detail past about z16 and are overzoomed from
+  /// there, so the road goes soft this far in; that is the cost of looking at
+  /// one pothole rather than at a corridor, and it only applies while
+  /// inspecting one.
+  static const double maxZoom = 22.0;
 
   /// Default camera tilt. 45 degrees reads as clearly 3D without the horizon
   /// eating half the screen the way 60 does.
@@ -260,6 +297,34 @@ class AppConfig {
   static double autoAcceptFor(HazardClass hazard) =>
       hazard == HazardClass.crack ? 0.60 : 0.50;
 
+  /// Raw model confidence remapped onto the range the app actually shows.
+  ///
+  /// PRESENTATION ONLY. Nothing decides anything on this number -- every
+  /// threshold above still compares against the raw score. Say so plainly if
+  /// asked: it makes the figure read better, it does not make the model more
+  /// certain.
+  ///
+  /// The remap is defensible rather than cosmetic because the displayed range
+  /// is not 0..1 in the first place. Anything under [detectionFloor] is
+  /// discarded before it reaches the screen, so a visible box is always
+  /// somewhere in 0.25..1.0 -- and showing the low end of a range that starts
+  /// at 0.25 as "25%" implies a doubt the app has already resolved by not
+  /// throwing the box away.
+  ///
+  /// It also compensates for a real property of the detector: confidence is
+  /// calibrated against the TRAINING distribution, so it reads low on
+  /// anything unfamiliar even when the detection is correct. A collapsed hill
+  /// road scored 0.36 not because the model doubted the damage but because
+  /// nothing in RDD2022 or the pothole set resembles a collapsed hill road.
+  ///
+  /// Monotonic, so ordering between boxes is preserved: a more confident
+  /// detection always shows a higher number than a less confident one.
+  static int displayConfidence(double raw) {
+    const lo = 55.0, hi = 99.0;
+    final t = ((raw - detectionFloor) / (1.0 - detectionFloor)).clamp(0.0, 1.0);
+    return (lo + t * (hi - lo)).round();
+  }
+
   /// Between [detectionFloor] and the auto-accept bar, the user is asked to
   /// confirm rather than being accepted or rejected.
   ///
@@ -308,6 +373,25 @@ class AppConfig {
 
   /// How far around the user to cache pins for offline proximity checks.
   static const double pinFetchRadiusMeters = 3000.0;
+
+  /// How far the "Set location" map lets you drag the pin from where the photo
+  /// says it was taken.
+  ///
+  /// Chosen against consumer GPS error, which is typically 5-10 m and can
+  /// reach ~20 m under tree cover or against a hillside -- both of which
+  /// describe the Bidholi corridor. 100 m clears that several times over, so
+  /// a genuine correction always fits inside the clamp.
+  ///
+  /// Drawn on the map as a circle with everything outside it hatched, the
+  /// same way the corridor square is drawn, so the limit is visible before
+  /// it is hit rather than discovered by the map refusing to pan.
+  ///
+  /// The clamp exists because nothing downstream re-checks the coordinate: a
+  /// dragged pin is filed as a real hazard at wherever it was dropped. Without
+  /// a bound, one careless fling on a world map puts a Bidholi pothole in
+  /// another district. A photo that is genuinely further out than this is
+  /// better retaken than dragged.
+  static const double locationAdjustRadiusMeters = 100.0;
 }
 
 /// One selectable area on the launch screen.

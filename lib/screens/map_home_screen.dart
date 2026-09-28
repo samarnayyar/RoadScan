@@ -8,7 +8,10 @@ import 'package:maplibre_gl/maplibre_gl.dart';
 
 import '../config/app_config.dart';
 import '../config/app_theme.dart';
+import '../config/hazard_3d.dart';
+import '../config/hazard_zone.dart';
 import '../config/map_layers.dart';
+import '../config/pin_icons.dart';
 import '../services/theme_controller.dart';
 import '../models/hazard_report.dart';
 import '../services/location_service.dart';
@@ -19,6 +22,7 @@ import 'package:image_picker/image_picker.dart';
 
 import '../services/device_identity.dart';
 import '../widgets/app_snackbar.dart';
+import '../widgets/pin_popup.dart';
 import '../widgets/app_drawer.dart';
 import '../widgets/glass_action_bar.dart';
 import '../widgets/hazard_alert_banner.dart';
@@ -47,6 +51,28 @@ class _MapHomeScreenState extends State<MapHomeScreen>
   /// enabling location twice does not open two GPS subscriptions.
   bool _locationActive = false;
 
+  /// The pin whose popup is showing, if any. Held as the report rather than
+  /// the id so the card keeps rendering unchanged while a refresh is in
+  /// flight -- looking up by id every build made the popup flicker empty for
+  /// a frame each time realtime fired.
+  /// Marks the tilt slider + button rail, so the card can be kept off them.
+  ///
+  /// Measured rather than assumed: their height depends on the theme buttons
+  /// present and on the device's safe-area inset, and a hardcoded guess would
+  /// drift the moment either changed.
+  final GlobalKey _controlsKey = GlobalKey();
+
+  HazardReport? _selectedPin;
+
+  /// Where the selected pin currently sits on screen, in LOGICAL pixels.
+  ///
+  /// Null while the camera is moving. The card is anchored to the pin rather
+  /// than parked at the bottom of the screen, so it has to follow the pin --
+  /// and MapLibre only hands back a screen position on request, one platform
+  /// round trip at a time. Asking every frame of a pan would be far too
+  /// expensive, so the card hides during movement and re-anchors on idle.
+  math.Point<double>? _pinAnchor;
+
   List<HazardReport> _reports = const [];
   bool _styleReady = false;
   bool _loadingPins = false;
@@ -69,6 +95,17 @@ class _MapHomeScreenState extends State<MapHomeScreen>
   final Set<String> _dismissedAlerts = {};
 
   CampusArea get _area => widget.area ?? AppConfig.areas.first;
+
+  /// The area the CAMERA is over, which is not always the one that was picked.
+  ///
+  /// The header used to show the chosen area forever, so panning up the
+  /// corridor to Kandholi left it still insisting you were at Nanda Ki
+  /// Chowki. The picker chooses a starting point; the header reports where
+  /// you actually are. Null until the first camera idle, when it falls back
+  /// to the chosen area.
+  CampusArea? _viewArea;
+
+  CampusArea get _shownArea => _viewArea ?? _area;
 
   final _scaffoldKey = GlobalKey<ScaffoldState>();
   String _deviceId = '';
@@ -109,6 +146,12 @@ class _MapHomeScreenState extends State<MapHomeScreen>
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    // Live pins. The callback carries no payload -- it means "refetch" -- so
+    // one definition of what belongs on the map stays on the server. See
+    // SupabaseService.subscribeToHazards.
+    SupabaseService.instance.subscribeToHazards(() {
+      if (mounted) _refreshPins();
+    });
     DeviceIdentity.instance.id.then((id) {
       if (mounted) setState(() => _deviceId = id);
     });
@@ -136,6 +179,7 @@ class _MapHomeScreenState extends State<MapHomeScreen>
     WidgetsBinding.instance.removeObserver(this);
     _positionSub?.cancel();
     _serviceSub?.cancel();
+    SupabaseService.instance.unsubscribeFromHazards();
     super.dispose();
   }
 
@@ -155,11 +199,26 @@ class _MapHomeScreenState extends State<MapHomeScreen>
 
   void _onMapCreated(MapLibreMapController controller) {
     _controller = controller;
+
+    // A tap that LANDS ON A PIN never reaches onMapClick.
+    //
+    // The pin layer is added with enableInteraction, which registers it with
+    // the platform as an interactive layer. MapLibre then routes a tap that
+    // hits one of its features to onFeatureTapped and stops -- onMapClick is
+    // only called for taps that hit nothing interactive. So the handler below
+    // is not a nicety or a duplicate: without it, tapping a pin does exactly
+    // nothing, while tapping the bare map a few pixels away works via the
+    // nearest-pin fallback. That asymmetry is what made this hard to spot.
+    controller.onFeatureTapped.add((point, coords, id, layerId, _) {
+      // The pin dot far out, the crater rim once it has faded in. Both carry
+      // the report id, so either opens the same card.
+      if (layerId != MapLayers.pinLayerId && layerId != Hazard3d.rimLayerId) {
+        return;
+      }
+      _selectPinById(id);
+    });
   }
 
-  /// Layers must be added after the style loads -- adding them against a
-  /// half-initialised style silently no-ops, which looks exactly like a
-  /// rendering bug and is a classic way to lose an afternoon.
   /// Guards against overlapping layer setup.
   ///
   /// MapLibre can fire onStyleLoaded more than once per style, and the passes
@@ -247,8 +306,18 @@ class _MapHomeScreenState extends State<MapHomeScreen>
     // was left looking at the loading spinner over a blank map -- a cosmetic
     // layer failure taking down the whole screen.
     try {
+      await Hazard3d.addLayers(c);
+
+      // Before the layer that names them: a symbol layer whose icon is not in
+      // the atlas renders nothing, and says nothing about why.
+      await PinIcons.register(c, HazardReport.severityColor);
       await MapLayers.addPinSource(c);
       await MapLayers.addPinLayers(c);
+
+      // After the markers, anchored below them: a band is context for a pin,
+      // never a thing that covers it. belowLayerId only works against a layer
+      // that already exists, so this cannot move above the call that adds it.
+      await HazardZone.addLayers(c, belowLayerId: MapLayers.pinLayerId);
     } catch (e) {
       debugPrint('RoadScan: pin layers unavailable: $e');
     }
@@ -477,16 +546,93 @@ class _MapHomeScreenState extends State<MapHomeScreen>
       setState(() {
         _reports = reports;
         _error = null;
+        // Re-resolve the open card against the new list, and drop it if the
+        // pin no longer qualifies -- a report merged away or moved into
+        // review must not keep showing a card for something not on the map.
+        final open = _selectedPin;
+        if (open != null) {
+          _selectedPin = reports.where((r) => r.id == open.id).firstOrNull;
+        }
       });
       await _controller?.setGeoJsonSource(
         MapLayers.pinSourceId,
         MapLayers.pinsGeoJson(reports),
       );
+      // force: the report list changed, so the geometry must be rebuilt even
+      // if the camera has not moved an inch.
+      await _syncCrater(force: true);
+      final mc = _controller;
+      if (mc != null) {
+        try {
+          await HazardZone.update(mc, reports);
+        } catch (e) {
+          debugPrint('RoadScan: hazard zones unavailable: $e');
+        }
+      }
     } catch (e) {
       if (!mounted) return;
       setState(() => _error = 'Could not load pins: $e');
     } finally {
       if (mounted) setState(() => _loadingPins = false);
+    }
+  }
+
+  /// Renames the header to whichever area the camera is now closest to.
+  void _updateViewArea() {
+    final target = _controller?.cameraPosition?.target;
+    if (target == null || !mounted) return;
+    final area = AppConfig.nearestAreaTo(target.latitude, target.longitude);
+    if (area.id == _shownArea.id) return;
+    setState(() => _viewArea = area);
+  }
+
+  /// Recomputes where the selected pin is on screen.
+  ///
+  /// toScreenLocation returns DEVICE pixels; Flutter lays out in logical
+  /// ones, so the result is divided by the device pixel ratio. On a 3x phone,
+  /// skipping that would place the card three times too far down and right --
+  /// off screen entirely.
+  Future<void> _updatePinAnchor() async {
+    final c = _controller;
+    final pin = _selectedPin;
+    if (c == null || pin == null) {
+      if (_pinAnchor != null && mounted) setState(() => _pinAnchor = null);
+      return;
+    }
+    try {
+      final p = await c.toScreenLocation(LatLng(pin.lat, pin.lon));
+      if (!mounted) return;
+      final dpr = MediaQuery.of(context).devicePixelRatio;
+      setState(() => _pinAnchor = math.Point(p.x / dpr, p.y / dpr));
+    } catch (e) {
+      debugPrint('RoadScan: could not locate pin on screen: $e');
+      if (mounted) setState(() => _pinAnchor = null);
+    }
+  }
+
+  /// Zoom the crater geometry was last built for.
+  double? _craterZoom;
+
+  /// Rebuilds the crater geometry when the zoom has moved enough to matter.
+  ///
+  /// The crater is sized partly against the screen, so its ground geometry is
+  /// a function of zoom. Gated on a 0.2-zoom delta so a pan or a pinch that
+  /// barely moves does not re-serialise every polygon across the platform
+  /// channel.
+  Future<void> _syncCrater({bool force = false}) async {
+    final c = _controller;
+    if (c == null || !_styleReady) return;
+    final zoom = c.cameraPosition?.zoom ?? AppConfig.initialZoom;
+    if (!force && _craterZoom != null && (zoom - _craterZoom!).abs() < 0.2) {
+      return;
+    }
+    _craterZoom = zoom;
+    try {
+      await Hazard3d.update(c, _reports, zoom: zoom);
+    } catch (e) {
+      // The crater is the headline visual, but the marker above it still
+      // conveys the hazard. Losing it must not lose the map.
+      debugPrint('RoadScan: crater update failed: $e');
     }
   }
 
@@ -506,7 +652,7 @@ class _MapHomeScreenState extends State<MapHomeScreen>
     try {
       features = await c.queryRenderedFeatures(
         point,
-        [MapLayers.pinCoreLayerId],
+        [MapLayers.pinLayerId, Hazard3d.rimLayerId],
         null,
       );
     } catch (e) {
@@ -519,22 +665,217 @@ class _MapHomeScreenState extends State<MapHomeScreen>
     // Fall back to nearest-pin-within-a-finger-width if the exact hit missed.
     id ??= _nearestPinId(coords, maxMeters: pad * _metresPerPixel(coords));
 
-    if (id == null) return;
-    HazardReport? report;
-    for (final r in _reports) {
-      if (r.id == id) {
-        report = r;
-        break;
+    // A tap on bare map dismisses an open card -- the same gesture that opens
+    // one should close it.
+    if (id == null) {
+      if (_selectedPin != null && mounted) {
+        setState(() {
+          _selectedPin = null;
+          _pinAnchor = null;
+        });
       }
+      return;
     }
-    if (report == null || !mounted) return;
 
-    await showPinDetailSheet(
-      context,
-      report: report,
-      onChanged: _refreshPins,
-    );
+    // Card, not the modal sheet.
+    //
+    // The sheet covers the map, which is the thing the rider was using to
+    // decide where to go. The card answers "what is this, how bad, how
+    // trusted" without hiding the route, and opens the sheet from its own
+    // button for anyone who wants the photo history.
+    _selectPinById(id);
   }
+
+  /// Where and when the last finger went down, for spotting a double tap.
+  Offset? _lastDownAt;
+  DateTime? _lastDownTime;
+
+  /// How close together in time two taps must be to count as one gesture.
+  /// Android's own threshold is 300ms; a little longer here because the first
+  /// tap does real work -- it opens a card -- so someone deciding to look
+  /// closer is reacting to what they just saw.
+  static const Duration _doubleTapWindow = Duration(milliseconds: 450);
+
+  /// And how close in space, in logical pixels. Two deliberate taps on the
+  /// same marker land within a finger's width; further apart and they are two
+  /// separate taps that happened to be quick.
+  static const double _doubleTapSlop = 44.0;
+
+  /// Catches double taps before MapLibre's gesture detector eats them.
+  ///
+  /// This has to happen at the pointer level, and the reason is worth
+  /// recording. Android's GestureDetector only reports onSingleTapConfirmed
+  /// once the double-tap timeout has passed with no second tap; when a second
+  /// tap does arrive it reports a double tap instead and the single-tap
+  /// callback never fires -- for EITHER tap. MapLibre dispatches its map and
+  /// feature click callbacks from onSingleTapConfirmed, so a double tap
+  /// produces no Flutter callback at all, and a detector built on those
+  /// callbacks can never see the gesture it is looking for. A Listener sees
+  /// the raw pointers and, because it never claims them in the gesture arena,
+  /// does not disturb panning, pinching or rotating.
+  void _onPointerDown(PointerDownEvent e) {
+    final now = DateTime.now();
+    final prev = _lastDownAt;
+    final prevAt = _lastDownTime;
+    _lastDownAt = e.localPosition;
+    _lastDownTime = now;
+
+    if (prev == null ||
+        prevAt == null ||
+        now.difference(prevAt) > _doubleTapWindow ||
+        (e.localPosition - prev).distance > _doubleTapSlop) {
+      return;
+    }
+
+    // Consumed, so a third tap starts a new gesture rather than chaining.
+    _lastDownAt = null;
+    _lastDownTime = null;
+    unawaited(_handleDoubleTap(e.localPosition));
+  }
+
+  /// A pin under the double tap means inspect it; anything else means zoom,
+  /// which is what the gesture did before we took it over.
+  Future<void> _handleDoubleTap(Offset localPosition) async {
+    final c = _controller;
+    if (c == null) return;
+
+    // queryRenderedFeatures works in DEVICE pixels; a Listener reports
+    // logical ones.
+    final dpr = MediaQuery.of(context).devicePixelRatio;
+    final point = math.Point<double>(
+      localPosition.dx * dpr,
+      localPosition.dy * dpr,
+    );
+
+    String? id;
+    try {
+      final hits = await c.queryRenderedFeatures(
+        point,
+        [MapLayers.pinLayerId, Hazard3d.rimLayerId],
+        null,
+      );
+      id = _idFromFeatures(hits);
+    } catch (e) {
+      debugPrint('RoadScan: double-tap hit test failed: $e');
+    }
+
+    final report = id == null ? null : _reportById(id);
+    if (report != null) {
+      if (mounted) setState(() => _selectedPin = report);
+      await _inspect(report);
+      return;
+    }
+
+    try {
+      await _zoomInAt(await c.toLatLng(point));
+    } catch (e) {
+      debugPrint('RoadScan: double-tap zoom failed: $e');
+    }
+  }
+
+  /// Replaces MapLibre's double-tap zoom, which is disabled so the gesture
+  /// can mean "inspect this hazard" on a pin. One zoom level toward the
+  /// point, as the built-in does.
+  Future<void> _zoomInAt(LatLng target) async {
+    final c = _controller;
+    if (c == null) return;
+    final cam = c.cameraPosition;
+    final zoom = math.min(
+      (cam?.zoom ?? AppConfig.initialZoom) + 1.0,
+      AppConfig.maxZoom,
+    );
+    try {
+      await c.animateCamera(
+        CameraUpdate.newCameraPosition(
+          CameraPosition(
+            target: target,
+            zoom: zoom,
+            tilt: cam?.tilt ?? _pitch,
+            bearing: cam?.bearing ?? _bearing,
+          ),
+        ),
+        duration: const Duration(milliseconds: 260),
+      );
+    } catch (e) {
+      debugPrint('RoadScan: zoom gesture failed: $e');
+    }
+  }
+
+  HazardReport? _reportById(String id) {
+    for (final r in _reports) {
+      if (r.id == id) return r;
+    }
+    return null;
+  }
+
+  /// Opens the card for [id], which arrives from the feature's `id` member.
+  ///
+  /// A single tap shows the card and leaves the map exactly where it is.
+  /// Flying in is a double tap, handled separately in [_onPointerDown],
+  /// because reading a pin and studying one are different intentions: tapping
+  /// a pin from the corridor view used to throw the camera down to street
+  /// level, losing the route the user was actually looking at.
+  void _selectPinById(String id) {
+    final report = _reportById(id);
+    if (report == null || !mounted) return;
+    setState(() => _selectedPin = report);
+    unawaited(_updatePinAnchor());
+  }
+
+  /// Moves the camera to where the hazard's 3D crater is actually readable.
+  ///
+  /// The crater's whole point is depth, and depth needs two things the default
+  /// corridor view does not give it: enough zoom that the funnel is more than
+  /// twenty pixels wide, and enough tilt that the eye sees the walls rather
+  /// than looking straight down a flat ring. Tapping a pin is the moment the
+  /// user asked to look at one hazard, so that is the moment to provide both.
+  ///
+  /// Both are raised, never lowered. Someone already at z19 studying the road
+  /// should not be yanked back out, and someone who deliberately flattened the
+  /// map to read street names keeps their choice of anything above the floor.
+  Future<void> _inspect(HazardReport r) async {
+    final c = _controller;
+    if (c == null) return;
+
+    final cam = c.cameraPosition;
+    final zoom = math.max(cam?.zoom ?? AppConfig.initialZoom, _inspectZoom);
+    final tilt = math.max(cam?.tilt ?? _pitch, _inspectPitch);
+
+    try {
+      await c.animateCamera(
+        CameraUpdate.newCameraPosition(
+          CameraPosition(
+            target: LatLng(r.lat, r.lon),
+            zoom: zoom,
+            tilt: tilt,
+            bearing: cam?.bearing ?? _bearing,
+          ),
+        ),
+        duration: AppConfig.flyToDuration,
+      );
+      if (mounted) setState(() => _pitch = tilt);
+      await _updatePinAnchor();
+    } catch (e) {
+      // A pin card that opened without the camera moving is still a usable
+      // pin card.
+      debugPrint('RoadScan: could not frame hazard ${r.id}: $e');
+    }
+  }
+
+  /// Where a DOUBLE tap takes the camera.
+  ///
+  /// The crater is drawn close to the footprint measured from the photo, so a
+  /// typical 0.9 m pothole is a few pixels at corridor zoom and about fifty
+  /// here. This is deliberately a separate gesture: a single tap now leaves
+  /// the camera alone, because the alternative -- drawing the pothole nine
+  /// metres wide so it shows up next to the buildings -- is a lie about the
+  /// road, and throwing the camera to street level uninvited is a lie about
+  /// what the user asked for.
+  static const double _inspectZoom = 21.0;
+
+  /// Enough tilt to see down into the funnel without the far wall hiding the
+  /// floor.
+  static const double _inspectPitch = 50.0;
 
   String? _idFromFeatures(List<dynamic> features) {
     for (final f in features) {
@@ -738,6 +1079,9 @@ class _MapHomeScreenState extends State<MapHomeScreen>
 
     _styleSwapInFlight = true;
     _builtStyle = styleUrl;
+    // setStyle discards every source and layer, patches included. Without
+    // this the tracker still claims them and refuses to re-add them, so the
+    // photos silently never come back after a theme change.
     // setStyle discards every layer, the buildings included, so the next
     // _ensureBuildings has to re-add them.
     _buildingsAdded = false;
@@ -805,6 +1149,23 @@ class _MapHomeScreenState extends State<MapHomeScreen>
             onMapCreated: _onMapCreated,
             onStyleLoadedCallback: _onStyleLoaded,
             onMapClick: _onMapClick,
+            // Taken over, not removed.
+            //
+            // MapLibre's own double-tap-to-zoom recognises the gesture and
+            // consumes the second tap, so a double tap on a pin arrived as a
+            // single one and the inspect gesture could never fire. Disabling
+            // it lets both taps through; _onMapClick puts the zoom back for
+            // taps that land on bare map, so the gesture still does what
+            // everyone expects everywhere it is not a pin.
+            doubleClickZoomEnabled: false,
+            // Drop the anchor the moment the map starts moving. A card left
+            // pinned to a stale screen position slides away from its own pin,
+            // which looks far worse than briefly not being there.
+            onCameraMove: (_) {
+              if (_pinAnchor != null && mounted) {
+                setState(() => _pinAnchor = null);
+              }
+            },
             // Keeps the demo inside Bidholi-Kandholi-Pondha: panning to Delhi
             // would show an empty map and read as a broken app.
             cameraTargetBounds: CameraTargetBounds(AppConfig.campusBounds),
@@ -840,6 +1201,9 @@ class _MapHomeScreenState extends State<MapHomeScreen>
               // Zoomed in far enough to need the buildings? Upload them now.
               // This is what keeps a theme switch cheap while zoomed out.
               _ensureBuildings();
+              _syncCrater();
+              _updatePinAnchor();
+              _updateViewArea();
 
               // Ignore idle events fired before we positioned the camera.
               if (!_cameraReady) return;
@@ -855,6 +1219,116 @@ class _MapHomeScreenState extends State<MapHomeScreen>
             },
           )
     );
+  }
+
+  /// Places the callout so its tail tip lands on the pin.
+  ///
+  /// Three rules, in order of precedence:
+  ///
+  ///   1. Never cover the map's own controls. The tilt slider and the button
+  ///      rail are how the user gets out of whatever the card is describing,
+  ///      so a card sitting on top of them is worse than one badly placed.
+  ///   2. Above the pin where there is room. The marker hangs above its own
+  ///      tip, so "above" has to clear the whole marker, not just the point.
+  ///   3. Below only as a fallback, and then pushed up if it would reach the
+  ///      controls.
+  ///
+  /// Horizontally the card is centred on the pin but kept inside the screen,
+  /// and the TAIL then slides within the card to keep pointing at the pin --
+  /// otherwise a pin near the edge would get a card that has slid away with a
+  /// tail aimed at empty road.
+  Widget _buildPinCallout() {
+    final pin = _selectedPin;
+    final anchor = _pinAnchor;
+    if (pin == null || anchor == null) return const SizedBox.shrink();
+
+    final size = MediaQuery.of(context).size;
+    final pad = MediaQuery.of(context).padding;
+    const width = PinPopup.cardWidth;
+
+    // The marker is anchored at its TIP, so it hangs entirely above the
+    // hazard's position. A card placed above must clear the marker's full
+    // height; one placed below needs only a small gap.
+    const gap = 6.0;
+    final clearance =
+        PinIcons.maxLogicalHeight(MediaQuery.of(context).devicePixelRatio) +
+            gap;
+
+    // Enough for the tallest the card gets -- chip, four fact rows, photo and
+    // the action strip. Only used to decide placement, so an overestimate
+    // costs nothing but a slightly eager flip.
+    const cardHeight = 250.0;
+
+    // Below the header, and above the controls.
+    final topLimit = pad.top + 64.0;
+    final controlsTop = _controlsTop() ?? (size.height - 380.0);
+    final bottomLimit = controlsTop - 8.0;
+
+    // Kept inside the channel between the tilt slider and the button rail,
+    // not merely inside the screen. Those two sit at the edges over the lower
+    // half of the map, and a card centred on a pin near either edge would
+    // land straight on top of them.
+    const sideInset = 60.0;
+    final minLeft = math.min(sideInset, math.max(0.0, size.width - width));
+    final maxLeft = math.max(minLeft, size.width - sideInset - width);
+    final left =
+        (anchor.x - width / 2).clamp(minLeft, maxLeft).toDouble();
+    final tailFraction =
+        ((anchor.x - left) / width).clamp(0.0, 1.0).toDouble();
+
+    final roomAbove = anchor.y - clearance - cardHeight >= topLimit;
+    final fitsBelow = anchor.y + gap + cardHeight <= bottomLimit;
+
+    // Below ONLY when it genuinely fits there. The earlier version placed the
+    // card below and then slid it up to clear the controls, which for a pin
+    // low on screen slid it straight over the marker it belonged to -- the
+    // card ended up hiding the thing it was describing. Going above instead
+    // can never do that, because above is measured from the marker's top.
+    final above = roomAbove || !fitsBelow;
+
+    double? top;
+    double? bottom;
+    if (above) {
+      // Not clamped against the top, deliberately. Pulling the card back down
+      // to fit under the header would walk it straight onto the marker, which
+      // is the one thing this must never do. `above` is only chosen when
+      // there is room above or the pin is low enough that there is plenty, so
+      // the unclamped case needs a map area shorter than the card itself.
+      bottom = size.height - anchor.y + clearance;
+    } else {
+      top = anchor.y + gap;
+    }
+
+    return Positioned(
+      left: left,
+      width: width,
+      top: top,
+      bottom: bottom,
+      child: PinPopup(
+        key: ValueKey(pin.id),
+        report: pin,
+        tailFraction: tailFraction,
+        tailBelow: above,
+        onDismiss: () => setState(() {
+          _selectedPin = null;
+          _pinAnchor = null;
+        }),
+        onOpenDetail: () => showPinDetailSheet(
+          context,
+          report: pin,
+          onChanged: _refreshPins,
+        ),
+        onInspect: () => unawaited(_inspect(pin)),
+      ),
+    );
+  }
+
+  /// Top edge of the tilt slider and button rail, in logical pixels, or null
+  /// before the first layout.
+  double? _controlsTop() {
+    final box = _controlsKey.currentContext?.findRenderObject();
+    if (box is! RenderBox || !box.hasSize) return null;
+    return box.localToGlobal(Offset.zero).dy;
   }
 
   // ---------------------------------------------------------------------------
@@ -888,7 +1362,11 @@ class _MapHomeScreenState extends State<MapHomeScreen>
       drawer: AppDrawer(deviceId: _deviceId.isEmpty ? '00000000' : _deviceId),
       body: Stack(
         children: [
-          _buildMap(styleUrl, kind),
+          Listener(
+            behavior: HitTestBehavior.translucent,
+            onPointerDown: _onPointerDown,
+            child: _buildMap(styleUrl, kind),
+          ),
 
           if (!_styleReady)
             ColoredBox(
@@ -924,7 +1402,7 @@ class _MapHomeScreenState extends State<MapHomeScreen>
                         reports: _reports,
                         loading: _loadingPins,
                         onRefresh: _refreshPins,
-                        areaName: _area.name,
+                        areaName: _shownArea.name,
                         onSwitchArea: _switchArea,
                       ),
                     ),
@@ -936,7 +1414,7 @@ class _MapHomeScreenState extends State<MapHomeScreen>
                 // left, so it is the first thing in the reading path and never
                 // covers the Scan button.
                 Padding(
-                  padding: const EdgeInsets.fromLTRB(12, 10, 40, 0),
+                  padding: const EdgeInsets.fromLTRB(12, 10, 12, 0),
                   child: AnimatedAlertSlot(
                     child: _alertReport == null
                         ? null
@@ -959,7 +1437,9 @@ class _MapHomeScreenState extends State<MapHomeScreen>
                 ),
 
                 const Spacer(),
+
                 Padding(
+                  key: _controlsKey,
                   padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
                   child: Row(
                     crossAxisAlignment: CrossAxisAlignment.end,
@@ -1047,6 +1527,16 @@ class _MapHomeScreenState extends State<MapHomeScreen>
               ],
             ),
           ),
+
+          // The tapped-pin callout, anchored over its own pin.
+          //
+          // LAST in the stack, which is the whole point: a Stack paints its
+          // children in order, so anything listed after this would cover it.
+          // It sat before the chrome column and the tilt slider and the
+          // button rail drew straight over the card. It is outside that
+          // column because it is positioned against the map's own screen
+          // coordinates rather than stacked in the chrome's layout flow.
+          _buildPinCallout(),
         ],
       ),
     );

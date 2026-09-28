@@ -44,6 +44,8 @@ class HazardReport {
     this.distanceMeters,
     this.latestPhotoPath,
     this.photoCount = 1,
+    this.widthM,
+    this.lengthM,
   });
 
   final String id;
@@ -66,6 +68,16 @@ class HazardReport {
 
   /// How many photos are attached. Drives the history badge in the list.
   final int photoCount;
+
+  /// Estimated ground size of the damage in metres, or null when unknown.
+  /// See lib/services/ground_footprint.dart for how it is derived and why it
+  /// is an estimate rather than a measurement.
+  final double? widthM;
+  final double? lengthM;
+
+  /// True when there is enough information to draw this at a real size.
+  bool get hasFootprint =>
+      widthM != null && lengthM != null && widthM! > 0 && lengthM! > 0;
 
   bool get isFresh =>
       DateTime.now().difference(createdAt) < AppConfig.freshWindow;
@@ -103,19 +115,43 @@ class HazardReport {
       latestPhotoPath: row['latest_photo'] as String?,
       // Absent from nearby_reports, present in the list RPCs.
       photoCount: (row['photo_count'] as num?)?.toInt() ?? 1,
+      // Null is normal, not a fault: reports filed before migration 010 have
+      // none, and the estimator declines boxes whose geometry it cannot
+      // trust. Anything drawing from these must handle null rather than
+      // substituting a default size.
+      widthM: (row['width_m'] as num?)?.toDouble(),
+      lengthM: (row['length_m'] as num?)?.toDouble(),
     );
   }
 
   /// Map pin colour. Severity drives hue; confidence drives opacity, applied at
   /// render time so a decaying pin visibly fades rather than vanishing.
-  Color get color => switch (severity) {
+  Color get color => severityColor(severity);
+
+  /// The same hue, reachable without a report.
+  ///
+  /// The marker bitmaps are generated once per style load, before any report
+  /// exists, so the palette cannot live on the instance alone -- and having
+  /// it in two places is how a pin ends up a different colour from the crater
+  /// underneath it.
+  static Color severityColor(SeverityClass s) => switch (s) {
         SeverityClass.low => const Color(0xFF3FA34D),
         SeverityClass.medium => const Color(0xFFE8B21A),
         SeverityClass.high => const Color(0xFFE2661C),
         SeverityClass.critical => const Color(0xFFD32F2F),
       };
 
-  /// Never fully transparent -- a pin at 0.05 confidence is still a pin someone
-  /// should be able to tap and re-confirm.
-  double get markerOpacity => isFixed ? 0.35 : (0.35 + 0.65 * confidence);
+  /// Marker opacity. Deliberately NOT tied to confidence.
+  ///
+  /// It used to fade with the decaying confidence score, so a report nobody
+  /// had re-confirmed in two months rendered at about a third opacity next to
+  /// a solid red one. On the map that does not read as "this is old" -- it
+  /// reads as a half-drawn pin, or a bug. Age is a fact about the report, and
+  /// facts belong in the card, which already says "Seen 69 days ago" and
+  /// "Unverified recently" in as many words.
+  ///
+  /// A pin voted fixed is the one real exception: it has been resolved, so it
+  /// steps back without disappearing, because someone may still need to
+  /// re-report it.
+  double get markerOpacity => isFixed ? 0.55 : 1.0;
 }

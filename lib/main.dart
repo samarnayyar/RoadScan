@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import 'config/app_theme.dart';
 import 'screens/area_select_screen.dart';
@@ -8,6 +9,20 @@ import 'services/theme_controller.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  // Portrait only.
+  //
+  // Every screen here is a single vertical column -- the map with its pitch
+  // slider and action bar, the capture review, the report sheet -- and in
+  // landscape there is simply not enough height for them: the map screen
+  // overflows its own layout by about 80px on this phone. Landscape would
+  // need a genuinely different layout for each screen, and it is not a
+  // posture anyone holds a phone in while checking the road ahead. Locking
+  // it is the honest fix rather than squeezing a column that does not fit.
+  await SystemChrome.setPreferredOrientations([
+    DeviceOrientation.portraitUp,
+    DeviceOrientation.portraitDown,
+  ]);
 
   // Before runApp so the first frame is already in the right theme -- loading
   // it afterwards would flash the wrong palette on every cold start.

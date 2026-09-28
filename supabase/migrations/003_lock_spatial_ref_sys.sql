@@ -48,6 +48,23 @@
 -- for coordinate work, and revoking it risks breaking spatial operations for
 -- no security gain, given the contents are public knowledge.
 -- ---------------------------------------------------------------------------
+-- PUBLIC FIRST. This is the line the first version of this migration missed.
+--
+-- PostGIS grants spatial_ref_sys to the PUBLIC pseudo-role, not to anon and
+-- authenticated individually. Revoking from those two named roles therefore
+-- changed nothing they could actually do -- they still held the privilege
+-- through PUBLIC, which every role is a member of implicitly. Verified after
+-- running v1 of this file: DELETE and PATCH were still accepted with a 204.
+--
+-- A revoke only removes the grant you name. It does not strip an equivalent
+-- privilege arriving by another path, and it fails silently rather than
+-- telling you the role can still do the thing.
+revoke insert, update, delete, truncate
+  on table public.spatial_ref_sys
+  from public;
+
+-- Then the named roles, in case a direct grant also exists alongside the
+-- PUBLIC one -- revoking PUBLIC would not remove that either.
 revoke insert, update, delete, truncate
   on table public.spatial_ref_sys
   from anon, authenticated;
@@ -92,6 +109,16 @@ $$;
 -- Expect: has_write = false for anon and authenticated on spatial_ref_sys,
 -- and rls_enabled = true for all three RoadScan tables.
 -- ---------------------------------------------------------------------------
+-- Who actually holds what, by every path. `has_table_privilege` below is the
+-- verdict that matters, but this shows WHERE a surviving privilege comes
+-- from -- a PUBLIC row here is what made the first attempt look successful
+-- while changing nothing.
+select grantee, privilege_type
+from information_schema.role_table_grants
+where table_schema = 'public'
+  and table_name = 'spatial_ref_sys'
+order by grantee, privilege_type;
+
 select
   r.rolname                                                as role,
   has_table_privilege(r.rolname, 'public.spatial_ref_sys', 'select') as can_read,
