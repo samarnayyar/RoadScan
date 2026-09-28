@@ -23,7 +23,6 @@ class PinPopup extends StatelessWidget {
     required this.report,
     required this.onDismiss,
     required this.onOpenDetail,
-    required this.onInspect,
     this.tailFraction = 0.5,
     this.tailBelow = true,
   });
@@ -31,11 +30,6 @@ class PinPopup extends StatelessWidget {
   final HazardReport report;
   final VoidCallback onDismiss;
   final VoidCallback onOpenDetail;
-
-  /// Fly the camera down to the 3D crater. Same thing a double tap on the pin
-  /// does -- offered as a button because a gesture with nothing on screen to
-  /// suggest it is a feature most people never find.
-  final VoidCallback onInspect;
 
   /// Where along the card's width the tail sits, 0 (left edge) to 1 (right).
   ///
@@ -244,19 +238,7 @@ class PinPopup extends StatelessWidget {
         color: c.surfaceAlt,
         border: Border(top: BorderSide(color: c.border)),
       ),
-      child: Row(
-        children: [
-          Expanded(
-            child: _action(c, Icons.article_outlined, 'Full report',
-                onOpenDetail),
-          ),
-          Container(width: 1, height: 34, color: c.border),
-          Expanded(
-            child: _action(c, Icons.view_in_ar_outlined, 'View in 3D',
-                onInspect),
-          ),
-        ],
-      ),
+      child: _action(c, Icons.article_outlined, 'Full report', onOpenDetail),
     );
   }
 

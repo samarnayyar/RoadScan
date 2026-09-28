@@ -6,6 +6,7 @@ import '../config/app_config.dart';
 import '../config/app_theme.dart';
 import '../models/detection.dart';
 import '../models/hazard_report.dart';
+import '../services/admin_mode.dart';
 import '../services/ground_footprint.dart';
 import '../services/location_service.dart';
 import '../services/supabase_service.dart';
@@ -58,6 +59,50 @@ class _PinDetailSheetState extends State<PinDetailSheet> {
   void initState() {
     super.initState();
     _photos = SupabaseService.instance.timeline(widget.report.id);
+  }
+
+  bool _deleting = false;
+
+  /// Asks first. A delete is irreversible and removes the report from every
+  /// device, which is a different weight of action from the votes above it.
+  Future<void> _confirmDelete() async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Delete this report?'),
+        content: const Text(
+          'It is removed for everyone, along with its photos and '
+          'confirmations. This cannot be undone.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            style: FilledButton.styleFrom(
+              backgroundColor: const Color(0xFFD32F2F),
+            ),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
+
+    setState(() => _deleting = true);
+    try {
+      await SupabaseService.instance.adminDeleteReport(widget.report.id);
+      await widget.onChanged();
+      if (mounted) Navigator.of(context).pop();
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _deleting = false;
+        _voteMessage = 'Could not delete: $e';
+      });
+    }
   }
 
   Future<void> _vote({required bool negative}) async {
@@ -167,6 +212,30 @@ class _PinDetailSheetState extends State<PinDetailSheet> {
             // The record's own identity, last and quietest. Useful when
             // comparing what two phones are showing for the same defect.
             _IdRow(id: r.id),
+
+            // Admin only, and absent entirely otherwise -- this removes the
+            // report for every device, so it must not be one stray tap away
+            // for an ordinary user.
+            ValueListenableBuilder<bool>(
+              valueListenable: AdminMode.instance.enabled,
+              builder: (context, admin, _) {
+                if (!admin || !AppConfig.hasAdminToken) {
+                  return const SizedBox.shrink();
+                }
+                return Padding(
+                  padding: const EdgeInsets.only(top: 14),
+                  child: OutlinedButton.icon(
+                    onPressed: _deleting ? null : _confirmDelete,
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: const Color(0xFFD32F2F),
+                      side: const BorderSide(color: Color(0x55D32F2F)),
+                    ),
+                    icon: const Icon(Icons.delete_outline, size: 18),
+                    label: Text(_deleting ? 'Deleting...' : 'Delete report'),
+                  ),
+                );
+              },
+            ),
           ],
         );
       },

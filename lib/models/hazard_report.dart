@@ -132,8 +132,8 @@ class HazardReport {
   ///
   /// The marker bitmaps are generated once per style load, before any report
   /// exists, so the palette cannot live on the instance alone -- and having
-  /// it in two places is how a pin ends up a different colour from the crater
-  /// underneath it.
+  /// it in two places is how a pin ends up a different colour from the alert
+  /// band beneath it.
   static Color severityColor(SeverityClass s) => switch (s) {
         SeverityClass.low => const Color(0xFF3FA34D),
         SeverityClass.medium => const Color(0xFFE8B21A),

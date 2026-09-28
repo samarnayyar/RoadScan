@@ -274,6 +274,21 @@ class SupabaseService {
     );
   }
 
+  /// Deletes a report outright. Admin only -- see migration 011.
+  ///
+  /// The token is checked server-side, so a build without one cannot delete
+  /// even if something calls this by mistake.
+  Future<bool> adminDeleteReport(String reportId) async {
+    if (!AppConfig.hasAdminToken) {
+      throw StateError('No admin token in this build');
+    }
+    final ok = await _db.rpc('admin_delete_report', params: {
+      'p_report_id': reportId,
+      'p_token': AppConfig.adminToken,
+    });
+    return ok == true;
+  }
+
   Future<String> _uploadPhoto(File photo, String deviceId) async {
     final bytes = await photo.readAsBytes();
     final ext = p.extension(photo.path).replaceFirst('.', '').toLowerCase();

@@ -30,7 +30,10 @@ class PitchControl extends StatelessWidget {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 10),
       decoration: BoxDecoration(
-        color: c.surface.withValues(alpha: 0.94),
+        // Opaque in the light theme, to match the button rail: at 94% the
+        // imagery underneath still tinted it a shade greyer than its
+        // neighbours.
+        color: c.isDark ? c.surface.withValues(alpha: 0.94) : c.surface,
         borderRadius: BorderRadius.circular(22),
         // chromeBorder, not border: this floats on the map, so its outline
         // has to contrast with the basemap rather than with a surface.

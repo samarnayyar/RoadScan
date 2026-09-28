@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:maplibre_gl/maplibre_gl.dart';
 
 import '../config/app_config.dart';
+import '../services/admin_mode.dart';
 import '../config/map_layers.dart';
 import '../services/photo_metadata.dart';
 
@@ -54,7 +55,7 @@ class _AdjustLocationScreenState extends State<AdjustLocationScreen> {
     // see. The square bounds stay as the cheap first line of defence: they
     // stop the fling during the gesture, and this only has to tidy up the
     // corners afterwards.
-    final radius = AppConfig.locationAdjustRadiusMeters;
+    final radius = _radius;
     if (_metresFromInitial(target) > radius) {
       final clamped = _clampToRadius(target, radius);
       setState(() {
@@ -84,6 +85,16 @@ class _AdjustLocationScreenState extends State<AdjustLocationScreen> {
   /// degree of longitude is shorter than a degree of latitude everywhere but
   /// the equator. Normalising the raw degree offsets would put the clamped
   /// point off the circle it is supposed to land on, worst at the diagonals.
+  /// How far the pin may be dragged from where the photo was taken.
+  ///
+  /// Normally 100m -- wide enough for a genuine GPS correction, tight enough
+  /// that a photo cannot be relocated across town. In admin mode the limit is
+  /// effectively lifted to the operating square, which is the whole point of
+  /// that mode: testing the corridor without standing on it.
+  double get _radius => AdminMode.instance.isOn
+      ? 50000.0
+      : AppConfig.locationAdjustRadiusMeters;
+
   LatLng _clampToRadius(LatLng p, double radius) {
     const mPerDegLat = 111320.0;
     final cosLat = math.cos(widget.initial.latitude * math.pi / 180.0);
@@ -210,10 +221,13 @@ class _AdjustLocationScreenState extends State<AdjustLocationScreen> {
             // genuine correction always fits, while a gross relocation cannot
             // happen by accident. Someone whose photo is truly further out
             // than this should retake it rather than drag it across town.
-            cameraTargetBounds: CameraTargetBounds(_boundsAround(
-              widget.initial,
-              AppConfig.locationAdjustRadiusMeters,
-            )),
+            cameraTargetBounds: CameraTargetBounds(
+              AdminMode.instance.isOn
+                  // Admin: the whole operating square, so a report can be
+                  // placed on any road without standing on it.
+                  ? AppConfig.campusBounds
+                  : _boundsAround(widget.initial, _radius),
+            ),
             onMapCreated: (c) => _controller = c,
             onStyleLoadedCallback: () async {
               // Same bundled footprints as the main map, not the basemap's
@@ -238,12 +252,16 @@ class _AdjustLocationScreenState extends State<AdjustLocationScreen> {
                   hatchId = 'roadscan-hatch';
                   await _controller!.addImage(hatchId, hatch);
                 }
-                await MapLayers.addRadiusMask(
-                  _controller!,
-                  centre: widget.initial,
-                  radiusMeters: AppConfig.locationAdjustRadiusMeters,
-                  hatchImageId: hatchId,
-                );
+                // No mask in admin mode: there is no circle to show when
+                // the whole square is in range.
+                if (!AdminMode.instance.isOn) {
+                  await MapLayers.addRadiusMask(
+                    _controller!,
+                    centre: widget.initial,
+                    radiusMeters: _radius,
+                    hatchImageId: hatchId,
+                  );
+                }
               } catch (e) {
                 // The camera clamp is the real restriction; this only shows
                 // where it is. Losing it must not lose the screen.

@@ -21,12 +21,6 @@ dependencies:
   # final-year demo on.
   maplibre_gl: ^0.27.1
 
-  # Google's own map, offered as a second view alongside the MapLibre one --
-  # not a replacement. MapLibre draws the 3D hazard craters (fill-extrusion,
-  # no key, no quota); Google answers "what does this junction actually look
-  # like", which vector tiles cannot. See MapMode in map_home_screen.
-  google_maps_flutter: ^2.9.0
-
   # --- Backend -------------------------------------------------------------
   supabase_flutter: ^2.8.0
 
@@ -90,6 +84,11 @@ flutter:
     # (c) OpenStreetMap contributors, ODbL; corridor routed with OSRM.
     - assets/rivers.geojson
     - assets/corridor.geojson
+
+    # Every drivable road in the operating square, from OSM. Hazard alert
+    # bands snap onto these, so a report on a side street gets a band in the
+    # right place instead of none at all. See tool/fetch_roads.py.
+    - assets/roads.geojson
     # App mark, generated from logo.jpg by tool/make_icons.py (which also
     # writes the Android launcher icons). Transparent, so it sits on any of
     # the three themes.

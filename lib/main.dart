@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 
 import 'config/app_theme.dart';
 import 'screens/area_select_screen.dart';
+import 'services/admin_mode.dart';
 import 'services/proximity_alerts.dart';
 import 'services/supabase_service.dart';
 import 'services/theme_controller.dart';
@@ -27,6 +28,10 @@ Future<void> main() async {
   // Before runApp so the first frame is already in the right theme -- loading
   // it afterwards would flash the wrong palette on every cold start.
   await ThemeController.instance.load();
+
+  // Hidden developer flag; see AdminMode. Loaded here so the capture flow
+  // does not have to await it mid-gesture.
+  await AdminMode.instance.load();
 
   // Neither of these is allowed to prevent the app from starting. A missing
   // Supabase key or a denied notification permission should degrade the app to

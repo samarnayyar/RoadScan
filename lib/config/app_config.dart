@@ -226,14 +226,10 @@ class AppConfig {
   static const Duration pitchDuration = Duration(milliseconds: 220);
   /// How far in the map will go.
   ///
-  /// Raised from 19 for the 3D crater. A crater is drawn at the footprint
-  /// measured from the photo -- under a metre for a typical pothole -- which
-  /// is about seven pixels at z19: not a rendering bug, just too small to
-  /// see. It takes z21.5 for a 0.9 m hole to be forty pixels across. The
-  /// vector tiles have no detail past about z16 and are overzoomed from
-  /// there, so the road goes soft this far in; that is the cost of looking at
-  /// one pothole rather than at a corridor, and it only applies while
-  /// inspecting one.
+  /// Raised from 19 when the 3D crater needed close inspection. Kept there
+  /// after it was removed, because the satellite view benefits from the same
+  /// reach: the imagery is sharp well past z19, and a rider checking exactly
+  /// which side of the lane a hazard is on wants to get close.
   static const double maxZoom = 22.0;
 
   /// Default camera tilt. 45 degrees reads as clearly 3D without the horizon
@@ -391,6 +387,16 @@ class AppConfig {
   /// a bound, one careless fling on a world map puts a Bidholi pothole in
   /// another district. A photo that is genuinely further out than this is
   /// better retaken than dragged.
+  /// Token for the admin delete RPC, from --dart-define=ADMIN_TOKEN.
+  ///
+  /// Not in supabase.json, and not in the repository: that file is committed,
+  /// which is fine for a publishable key and not fine for the one credential
+  /// that can destroy data. Empty means admin delete is simply unavailable,
+  /// which is the right default for every build but the one on this phone.
+  static const String adminToken = String.fromEnvironment('ADMIN_TOKEN');
+
+  static bool get hasAdminToken => adminToken.isNotEmpty;
+
   static const double locationAdjustRadiusMeters = 100.0;
 }
 

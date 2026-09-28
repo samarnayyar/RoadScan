@@ -4,13 +4,12 @@ import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 import 'package:geolocator/geolocator.dart';
-import 'package:google_maps_flutter/google_maps_flutter.dart' as gmap;
 import 'package:maplibre_gl/maplibre_gl.dart';
 
 import '../config/app_config.dart';
 import '../config/app_theme.dart';
-import '../config/hazard_3d.dart';
 import '../config/hazard_zone.dart';
+import '../config/satellite_layer.dart';
 import '../config/map_layers.dart';
 import '../config/pin_icons.dart';
 import '../services/theme_controller.dart';
@@ -26,7 +25,6 @@ import '../widgets/app_snackbar.dart';
 import '../widgets/pin_popup.dart';
 import '../widgets/app_drawer.dart';
 import '../widgets/glass_action_bar.dart';
-import '../widgets/google_map_view.dart';
 import '../widgets/hazard_alert_banner.dart';
 import '../widgets/map_mode_switch.dart';
 import '../widgets/pin_detail_sheet.dart';
@@ -67,14 +65,6 @@ class _MapHomeScreenState extends State<MapHomeScreen>
 
   /// Which map is under the chrome. See MapMode.
   MapMode _mapMode = MapMode.roadscan;
-
-  /// The camera the OTHER view was left at, so switching back returns to the
-  /// same place rather than resetting to the area centre.
-  ///
-  /// Held as a plain record instead of either library's CameraPosition: both
-  /// define their own, and storing one would make the field lie about which
-  /// view owns it.
-  ({LatLng target, double zoom, double tilt, double bearing})? _handoverCamera;
 
   HazardReport? _selectedPin;
 
@@ -214,6 +204,15 @@ class _MapHomeScreenState extends State<MapHomeScreen>
   void _onMapCreated(MapLibreMapController controller) {
     _controller = controller;
 
+    // A new controller means a NEW style object with no layers in it, so
+    // every "have we added this yet" flag has to go back to false. Switching
+    // to the Google view destroys this widget and switching back builds a
+    // fresh one, and without this the buildings never returned: the guard
+    // still said they were present, so nothing re-added them and the skyline
+    // stayed empty until a theme change happened to reset it.
+    _buildingsAdded = false;
+    _styleReady = false;
+
     // A tap that LANDS ON A PIN never reaches onMapClick.
     //
     // The pin layer is added with enableInteraction, which registers it with
@@ -224,11 +223,8 @@ class _MapHomeScreenState extends State<MapHomeScreen>
     // nothing, while tapping the bare map a few pixels away works via the
     // nearest-pin fallback. That asymmetry is what made this hard to spot.
     controller.onFeatureTapped.add((point, coords, id, layerId, _) {
-      // The pin dot far out, the crater rim once it has faded in. Both carry
-      // the report id, so either opens the same card.
-      if (layerId != MapLayers.pinLayerId && layerId != Hazard3d.rimLayerId) {
-        return;
-      }
+      // Only the marker layer carries a report id.
+      if (layerId != MapLayers.pinLayerId) return;
       _selectPinById(id);
     });
   }
@@ -272,19 +268,20 @@ class _MapHomeScreenState extends State<MapHomeScreen>
       debugPrint('RoadScan: water layers unavailable: $e');
     }
 
-    // Dark basemap only: `liberty` already draws roads with plenty of
-    // contrast, but OpenFreeMap's `dark` style makes them nearly invisible.
-    // See MapLayers.addRoadContrast.
-    if (_builtStyle == AppTheme.mapStyleDark) {
-      try {
-        await MapLayers.addRoadContrast(
-          c,
-          neon: ThemeController.instance.isNeon,
-        );
-      } catch (e) {
-        debugPrint('RoadScan: road contrast layer unavailable: $e');
-      }
+    // Imagery goes in directly under the app's own lowest layer, so it hides
+    // the basemap's roads and labels but never the hazards drawn above it.
+    // Added here rather than earlier because belowLayerId needs that layer to
+    // exist already.
+    try {
+      await SatelliteLayer.addLayer(
+        c,
+        belowLayerId: MapLayers.waterBodyLayerId,
+      );
+    } catch (e) {
+      debugPrint('RoadScan: satellite layer unavailable: $e');
     }
+
+    await _syncRoadContrast(c);
 
     // ...and the corridor AFTER them, because its whole job is to stand out
     // from the road network it is part of.
@@ -320,8 +317,6 @@ class _MapHomeScreenState extends State<MapHomeScreen>
     // was left looking at the loading spinner over a blank map -- a cosmetic
     // layer failure taking down the whole screen.
     try {
-      await Hazard3d.addLayers(c);
-
       // Before the layer that names them: a symbol layer whose icon is not in
       // the atlas renders nothing, and says nothing about why.
       await PinIcons.register(c, HazardReport.severityColor);
@@ -382,34 +377,11 @@ class _MapHomeScreenState extends State<MapHomeScreen>
     // path here would replay the fly-in and yank the camera off wherever the
     // user was.
     if (_cameraReady) {
-      // Coming back from the Google view, this widget was rebuilt from
-      // nothing, so the camera is at whatever initialCameraPosition said
-      // rather than where the user actually was. Put it back.
-      //
-      // Jumped, not animated: the user pressed a toggle, not a fly-to, and a
-      // two-second swoop from the corridor overview would make the switch
-      // feel like a different place rather than the same one re-skinned.
-      final h = _handoverCamera;
-      if (h != null) {
-        await c.moveCamera(
-          CameraUpdate.newCameraPosition(
-            CameraPosition(
-              target: h.target,
-              zoom: h.zoom,
-              tilt: h.tilt,
-              bearing: h.bearing,
-            ),
-          ),
-        );
-        if (mounted) {
-          setState(() {
-            _pitch = h.tilt;
-            _bearing = h.bearing;
-          });
-        }
-      }
       await _pushPins();
-      await _ensureBuildings();
+      // Re-assert the chosen mode: a re-style discards every layer, so the
+      // new style comes back with the imagery hidden no matter which view the
+      // user was looking at. This also covers the buildings.
+      await _applyMapMode();
       return;
     }
 
@@ -435,7 +407,7 @@ class _MapHomeScreenState extends State<MapHomeScreen>
     await _refreshPins();
     // Last: the fly-in has finished by now, so the heavy geometry upload
     // lands on an idle frame rather than competing with the animation.
-    await _ensureBuildings();
+    await _applyMapMode();
   }
 
   /// True once the building extrusion exists in the CURRENT style object.
@@ -458,6 +430,8 @@ class _MapHomeScreenState extends State<MapHomeScreen>
   /// Adds the building extrusion if it is missing and the camera is close
   /// enough to see it. Safe and cheap to call repeatedly.
   Future<void> _ensureBuildings() async {
+    // The imagery already contains the real buildings.
+    if (_mapMode.isSatellite) return;
     if (_buildingsAdded) return;
     final c = _controller;
     if (c == null || !_styleReady) return;
@@ -486,11 +460,31 @@ class _MapHomeScreenState extends State<MapHomeScreen>
   }
 
   /// Pushes the cached pins into the (possibly new) style's source.
+  /// Pushes everything derived from [_reports] back into the style.
+  ///
+  /// Pins and hazard bands both come from that list, and a style reload
+  /// recreates BOTH sources empty. This used to push only the pins, so every
+  /// theme switch silently blanked the bands and nothing refilled them until
+  /// the next server fetch -- which is why they vanished going into dark or
+  /// neon and did not come back on the way out.
   Future<void> _pushPins() async {
-    await _controller?.setGeoJsonSource(
-      MapLayers.pinSourceId,
-      MapLayers.pinsGeoJson(_reports),
-    );
+    final c = _controller;
+    if (c == null) return;
+
+    try {
+      await c.setGeoJsonSource(
+        MapLayers.pinSourceId,
+        MapLayers.pinsGeoJson(_reports),
+      );
+    } catch (e) {
+      debugPrint('RoadScan: pin source unavailable: $e');
+    }
+
+    try {
+      await HazardZone.update(c, _reports);
+    } catch (e) {
+      debugPrint('RoadScan: hazard zones unavailable: $e');
+    }
   }
 
   /// True when a fix falls inside the operating square.
@@ -594,21 +588,9 @@ class _MapHomeScreenState extends State<MapHomeScreen>
           _selectedPin = reports.where((r) => r.id == open.id).firstOrNull;
         }
       });
-      await _controller?.setGeoJsonSource(
-        MapLayers.pinSourceId,
-        MapLayers.pinsGeoJson(reports),
-      );
-      // force: the report list changed, so the geometry must be rebuilt even
-      // if the camera has not moved an inch.
-      await _syncCrater(force: true);
-      final mc = _controller;
-      if (mc != null) {
-        try {
-          await HazardZone.update(mc, reports);
-        } catch (e) {
-          debugPrint('RoadScan: hazard zones unavailable: $e');
-        }
-      }
+      // One path for all three report-derived layers, shared with the
+      // style-reload route, so they cannot drift apart again.
+      await _pushPins();
     } catch (e) {
       if (!mounted) return;
       setState(() => _error = 'Could not load pins: $e');
@@ -650,32 +632,6 @@ class _MapHomeScreenState extends State<MapHomeScreen>
     }
   }
 
-  /// Zoom the crater geometry was last built for.
-  double? _craterZoom;
-
-  /// Rebuilds the crater geometry when the zoom has moved enough to matter.
-  ///
-  /// The crater is sized partly against the screen, so its ground geometry is
-  /// a function of zoom. Gated on a 0.2-zoom delta so a pan or a pinch that
-  /// barely moves does not re-serialise every polygon across the platform
-  /// channel.
-  Future<void> _syncCrater({bool force = false}) async {
-    final c = _controller;
-    if (c == null || !_styleReady) return;
-    final zoom = c.cameraPosition?.zoom ?? AppConfig.initialZoom;
-    if (!force && _craterZoom != null && (zoom - _craterZoom!).abs() < 0.2) {
-      return;
-    }
-    _craterZoom = zoom;
-    try {
-      await Hazard3d.update(c, _reports, zoom: zoom);
-    } catch (e) {
-      // The crater is the headline visual, but the marker above it still
-      // conveys the hazard. Losing it must not lose the map.
-      debugPrint('RoadScan: crater update failed: $e');
-    }
-  }
-
   /// Hit-tests the pin layer at the tap point.
   ///
   /// Querying rendered features (rather than comparing tap lat/lng to pin
@@ -692,7 +648,7 @@ class _MapHomeScreenState extends State<MapHomeScreen>
     try {
       features = await c.queryRenderedFeatures(
         point,
-        [MapLayers.pinLayerId, Hazard3d.rimLayerId],
+        [MapLayers.pinLayerId],
         null,
       );
     } catch (e) {
@@ -726,9 +682,21 @@ class _MapHomeScreenState extends State<MapHomeScreen>
     _selectPinById(id);
   }
 
-  /// Where and when the last finger went down, for spotting a double tap.
-  Offset? _lastDownAt;
-  DateTime? _lastDownTime;
+  /// The last finger-down that is still in progress.
+  Offset? _downAt;
+  DateTime? _downTime;
+
+  /// True once that finger has travelled far enough to be a drag, not a tap.
+  bool _downDragged = false;
+
+  /// Fingers currently on the glass. Two or more is a pinch or a rotate, and
+  /// neither can be half of a double tap.
+  int _pointersDown = 0;
+
+  /// The last COMPLETED tap: pressed and released without dragging. Only a
+  /// real tap can be the first half of a double tap.
+  Offset? _lastTapAt;
+  DateTime? _lastTapTime;
 
   /// How close together in time two taps must be to count as one gesture.
   /// Android's own threshold is 300ms; a little longer here because the first
@@ -740,6 +708,12 @@ class _MapHomeScreenState extends State<MapHomeScreen>
   /// same marker land within a finger's width; further apart and they are two
   /// separate taps that happened to be quick.
   static const double _doubleTapSlop = 44.0;
+
+  /// How far a finger may travel and still count as a tap rather than a drag.
+  static const double _tapMoveSlop = 12.0;
+
+  /// Longer than this and it was a press, not a tap.
+  static const Duration _tapMaxDuration = Duration(milliseconds: 320);
 
   /// Catches double taps before MapLibre's gesture detector eats them.
   ///
@@ -753,24 +727,86 @@ class _MapHomeScreenState extends State<MapHomeScreen>
   /// callbacks can never see the gesture it is looking for. A Listener sees
   /// the raw pointers and, because it never claims them in the gesture arena,
   /// does not disturb panning, pinching or rotating.
+  ///
+  /// The whole gesture has to be tracked, not just the down events. Watching
+  /// downs alone made fast panning zoom the map at random: a flick is
+  /// down-drag-up, and two flicks in quick succession put two downs close
+  /// together in both time and space, which is indistinguishable from a
+  /// double tap unless you also know the finger moved in between.
   void _onPointerDown(PointerDownEvent e) {
-    final now = DateTime.now();
-    final prev = _lastDownAt;
-    final prevAt = _lastDownTime;
-    _lastDownAt = e.localPosition;
-    _lastDownTime = now;
+    _pointersDown++;
 
-    if (prev == null ||
-        prevAt == null ||
-        now.difference(prevAt) > _doubleTapWindow ||
-        (e.localPosition - prev).distance > _doubleTapSlop) {
+    if (_pointersDown > 1) {
+      // A second finger: pinch or rotate. Abandon any tap in progress and any
+      // remembered one, so neither can pair with a later touch.
+      _downAt = null;
+      _downTime = null;
+      _lastTapAt = null;
+      _lastTapTime = null;
       return;
     }
 
-    // Consumed, so a third tap starts a new gesture rather than chaining.
-    _lastDownAt = null;
-    _lastDownTime = null;
-    unawaited(_handleDoubleTap(e.localPosition));
+    _downAt = e.localPosition;
+    _downTime = DateTime.now();
+    _downDragged = false;
+  }
+
+  void _onPointerMove(PointerMoveEvent e) {
+    final origin = _downAt;
+    if (origin == null || _downDragged) return;
+    if ((e.localPosition - origin).distance > _tapMoveSlop) {
+      _downDragged = true;
+    }
+  }
+
+  void _onPointerUp(PointerUpEvent e) {
+    _pointersDown = math.max(0, _pointersDown - 1);
+
+    final origin = _downAt;
+    final startedAt = _downTime;
+    _downAt = null;
+    _downTime = null;
+
+    final wasTap = origin != null &&
+        startedAt != null &&
+        !_downDragged &&
+        DateTime.now().difference(startedAt) <= _tapMaxDuration;
+
+    if (!wasTap) {
+      // A drag, a long press or part of a pinch. It cannot be either half of
+      // a double tap, and it clears any earlier tap so the next touch starts
+      // fresh.
+      _lastTapAt = null;
+      _lastTapTime = null;
+      return;
+    }
+
+    final now = DateTime.now();
+    final prev = _lastTapAt;
+    final prevAt = _lastTapTime;
+
+    final isDouble = prev != null &&
+        prevAt != null &&
+        now.difference(prevAt) <= _doubleTapWindow &&
+        (origin - prev).distance <= _doubleTapSlop;
+
+    if (isDouble) {
+      // Consumed, so a third tap starts a new gesture rather than chaining.
+      _lastTapAt = null;
+      _lastTapTime = null;
+      unawaited(_handleDoubleTap(origin));
+    } else {
+      _lastTapAt = origin;
+      _lastTapTime = now;
+    }
+  }
+
+  void _onPointerCancel(PointerCancelEvent e) {
+    _pointersDown = math.max(0, _pointersDown - 1);
+    _downAt = null;
+    _downTime = null;
+    _lastTapAt = null;
+    _lastTapTime = null;
   }
 
   /// A pin under the double tap means inspect it; anything else means zoom,
@@ -791,7 +827,7 @@ class _MapHomeScreenState extends State<MapHomeScreen>
     try {
       final hits = await c.queryRenderedFeatures(
         point,
-        [MapLayers.pinLayerId, Hazard3d.rimLayerId],
+        [MapLayers.pinLayerId],
         null,
       );
       id = _idFromFeatures(hits);
@@ -799,12 +835,10 @@ class _MapHomeScreenState extends State<MapHomeScreen>
       debugPrint('RoadScan: double-tap hit test failed: $e');
     }
 
+    // A pin under the double tap selects it; the zoom below then happens
+    // either way, which is what the gesture means everywhere else on the map.
     final report = id == null ? null : _reportById(id);
-    if (report != null) {
-      if (mounted) setState(() => _selectedPin = report);
-      await _inspect(report);
-      return;
-    }
+    if (report != null && mounted) setState(() => _selectedPin = report);
 
     try {
       await _zoomInAt(await c.toLatLng(point));
@@ -861,61 +895,6 @@ class _MapHomeScreenState extends State<MapHomeScreen>
     setState(() => _selectedPin = report);
     unawaited(_updatePinAnchor());
   }
-
-  /// Moves the camera to where the hazard's 3D crater is actually readable.
-  ///
-  /// The crater's whole point is depth, and depth needs two things the default
-  /// corridor view does not give it: enough zoom that the funnel is more than
-  /// twenty pixels wide, and enough tilt that the eye sees the walls rather
-  /// than looking straight down a flat ring. Tapping a pin is the moment the
-  /// user asked to look at one hazard, so that is the moment to provide both.
-  ///
-  /// Both are raised, never lowered. Someone already at z19 studying the road
-  /// should not be yanked back out, and someone who deliberately flattened the
-  /// map to read street names keeps their choice of anything above the floor.
-  Future<void> _inspect(HazardReport r) async {
-    final c = _controller;
-    if (c == null) return;
-
-    final cam = c.cameraPosition;
-    final zoom = math.max(cam?.zoom ?? AppConfig.initialZoom, _inspectZoom);
-    final tilt = math.max(cam?.tilt ?? _pitch, _inspectPitch);
-
-    try {
-      await c.animateCamera(
-        CameraUpdate.newCameraPosition(
-          CameraPosition(
-            target: LatLng(r.lat, r.lon),
-            zoom: zoom,
-            tilt: tilt,
-            bearing: cam?.bearing ?? _bearing,
-          ),
-        ),
-        duration: AppConfig.flyToDuration,
-      );
-      if (mounted) setState(() => _pitch = tilt);
-      await _updatePinAnchor();
-    } catch (e) {
-      // A pin card that opened without the camera moving is still a usable
-      // pin card.
-      debugPrint('RoadScan: could not frame hazard ${r.id}: $e');
-    }
-  }
-
-  /// Where a DOUBLE tap takes the camera.
-  ///
-  /// The crater is drawn close to the footprint measured from the photo, so a
-  /// typical 0.9 m pothole is a few pixels at corridor zoom and about fifty
-  /// here. This is deliberately a separate gesture: a single tap now leaves
-  /// the camera alone, because the alternative -- drawing the pothole nine
-  /// metres wide so it shows up next to the buildings -- is a lie about the
-  /// road, and throwing the camera to street level uninvited is a lie about
-  /// what the user asked for.
-  static const double _inspectZoom = 21.0;
-
-  /// Enough tilt to see down into the funnel without the far wall hiding the
-  /// floor.
-  static const double _inspectPitch = 50.0;
 
   String? _idFromFeatures(List<dynamic> features) {
     for (final f in features) {
@@ -1150,87 +1129,82 @@ class _MapHomeScreenState extends State<MapHomeScreen>
 
   /// Built exactly once. Theme changes go through [_syncStyle], never through
   /// a rebuild -- see [_builtStyle].
-  /// Swaps the map under the chrome, carrying the camera across.
+  /// Swaps the basemap under the app's own layers.
   ///
-  /// The point of the switch is that it is the SAME place in a different
-  /// skin, so the camera has to travel with it. The outgoing view's position
-  /// is captured here and handed to the incoming one; MapLibre's is read
-  /// straight off the controller, Google's arrives through its camera-idle
-  /// callback and is already stored.
-  ///
-  /// The open hazard card is closed on the way through. Its position is
-  /// anchored to a pin's screen coordinates in the view being torn down, so
-  /// leaving it up would park it over a map that has moved beneath it.
-  void _toggleMapMode() {
+  /// No camera handover, and that is the whole advantage of doing it this way.
+  /// Both modes are the same MapLibre map, so the position, the pins, the
+  /// bands simply stay where they are; only what is drawn
+  /// beneath them changes. An approach that swapped in a second map widget
+  /// had to capture and restore the camera on every toggle, and lost every
+  /// hazard layer in the process.
+  Future<void> _toggleMapMode() async {
     if (!mounted) return;
+    setState(() => _mapMode = _mapMode.other);
+    await _applyMapMode();
+  }
 
-    if (_mapMode == MapMode.roadscan) {
-      final cam = _controller?.cameraPosition;
-      if (cam != null) {
-        _handoverCamera = (
-          target: cam.target,
-          zoom: cam.zoom,
-          tilt: cam.tilt,
-          bearing: cam.bearing,
-        );
-      }
+  /// Draws the road network layer for the current theme and basemap.
+  ///
+  /// Needed on the dark vector basemap because OpenFreeMap's `dark` style
+  /// makes roads nearly invisible, and needed in EVERY theme over imagery,
+  /// where the satellite raster hides the basemap's own roads entirely and
+  /// this becomes the only road network on screen. `liberty` draws roads well
+  /// enough on its own, so the light vector basemap still skips it.
+  Future<void> _syncRoadContrast(MapLibreMapController c) async {
+    final darkBase = _builtStyle == AppTheme.mapStyleDark;
+    final satellite = _mapMode.isSatellite;
+
+    if (!darkBase && !satellite) {
+      try {
+        await c.removeLayer(MapLayers.roadsLayerId);
+      } catch (_) {/* not present */}
+      return;
     }
 
-    setState(() {
-      _mapMode = _mapMode.other;
-      _selectedPin = null;
-      _pinAnchor = null;
-    });
+    try {
+      await MapLayers.addRoadContrast(
+        c,
+        neon: ThemeController.instance.isNeon,
+        satellite: satellite,
+        darkBase: darkBase,
+      );
+    } catch (e) {
+      debugPrint('RoadScan: road contrast layer unavailable: $e');
+    }
   }
 
-  /// The camera the incoming view should open at.
+  /// Pushes the current mode onto the style.
   ///
-  /// Falls back to the chosen area rather than to nothing, which is what
-  /// happens on the very first switch before either view has reported a
-  /// position.
-  gmap.CameraPosition get _googleCamera {
-    final h = _handoverCamera;
-    return gmap.CameraPosition(
-      target: gmap.LatLng(
-        h?.target.latitude ?? _area.center.latitude,
-        h?.target.longitude ?? _area.center.longitude,
-      ),
-      zoom: h?.zoom ?? _area.zoom,
-      tilt: h?.tilt ?? _pitch,
-      bearing: h?.bearing ?? _bearing,
-    );
-  }
+  /// Also called after a style load, because a re-style throws every layer
+  /// away and the new one comes back in its default state -- imagery hidden,
+  /// buildings due -- regardless of which mode the user had chosen.
+  Future<void> _applyMapMode() async {
+    final c = _controller;
+    if (c == null || !_styleReady) return;
+    final satellite = _mapMode.isSatellite;
 
-  /// Stores Google's camera so the MapLibre view can be restored to it.
-  ///
-  /// MapLibre is not moved here, only recorded. It is not in the tree while
-  /// this view is open, so its controller is gone; the position is applied on
-  /// the way back, in _onStyleLoaded's camera setup.
-  void _onGoogleCameraIdle(gmap.CameraPosition cam) {
-    _handoverCamera = (
-      target: LatLng(cam.target.latitude, cam.target.longitude),
-      zoom: cam.zoom,
-      tilt: cam.tilt,
-      bearing: cam.bearing,
-    );
-  }
+    try {
+      await SatelliteLayer.setVisible(c, satellite);
+    } catch (e) {
+      debugPrint('RoadScan: satellite layer unavailable: $e');
+    }
 
-  /// Google's map, wired to the same reports and the same card.
-  Widget _buildGoogleMap() {
-    return GoogleMapView(
-      initialCamera: _googleCamera,
-      reports: _reports,
-      onCameraIdle: _onGoogleCameraIdle,
-      onHazardTapped: (r) {
-        if (!mounted) return;
-        // No screen anchor: the card's tail is positioned from MapLibre's
-        // toScreenLocation, which does not exist here. It falls back to a
-        // plain sheet, which is the honest thing to show rather than a tail
-        // pointing at a guess.
-        showPinDetailSheet(context, report: r, onChanged: _refreshPins);
-      },
-      onMapTapped: () {},
-    );
+    // Rebuilt rather than toggled: the road colour depends on the mode, so
+    // the layer has to be re-created with the right one.
+    await _syncRoadContrast(c);
+
+    if (satellite) {
+      // The imagery has the real rooftops in it; grey extrusions on top would
+      // draw every building twice.
+      try {
+        await c.setLayerVisibility(MapLayers.mlBuildingsLayerId, false);
+      } catch (_) {/* not added yet, which is the same as hidden */}
+    } else {
+      try {
+        await c.setLayerVisibility(MapLayers.mlBuildingsLayerId, true);
+      } catch (_) {/* _ensureBuildings will add them */}
+      await _ensureBuildings();
+    }
   }
 
   Widget _buildMap(String styleUrl, AppThemeKind kind) {
@@ -1265,10 +1239,9 @@ class _MapHomeScreenState extends State<MapHomeScreen>
             // launch-screen "dive in" transition stop dead the moment the map
             // appeared.
             initialCameraPosition: CameraPosition(
-              target: _handoverCamera?.target ?? _area.center,
-              zoom: _handoverCamera?.zoom ?? AppConfig.areaEntryZoom,
-              tilt: _handoverCamera?.tilt ?? 0,
-              bearing: _handoverCamera?.bearing ?? 0,
+              target: _area.center,
+              zoom: AppConfig.areaEntryZoom,
+              tilt: 0,
             ),
             onMapCreated: _onMapCreated,
             onStyleLoadedCallback: _onStyleLoaded,
@@ -1325,7 +1298,6 @@ class _MapHomeScreenState extends State<MapHomeScreen>
               // Zoomed in far enough to need the buildings? Upload them now.
               // This is what keeps a theme switch cheap while zoomed out.
               _ensureBuildings();
-              _syncCrater();
               _updatePinAnchor();
               _updateViewArea();
 
@@ -1442,7 +1414,6 @@ class _MapHomeScreenState extends State<MapHomeScreen>
           report: pin,
           onChanged: _refreshPins,
         ),
-        onInspect: () => unawaited(_inspect(pin)),
       ),
     );
   }
@@ -1486,19 +1457,16 @@ class _MapHomeScreenState extends State<MapHomeScreen>
       drawer: AppDrawer(deviceId: _deviceId.isEmpty ? '00000000' : _deviceId),
       body: Stack(
         children: [
-          // One or the other, never both. Keeping the MapLibre view alive
-          // behind Google's would hold a second GL surface and a second tile
-          // pipeline for something nobody can see.
-          if (_mapMode.isGoogle)
-            _buildGoogleMap()
-          else
-            Listener(
-              behavior: HitTestBehavior.translucent,
-              onPointerDown: _onPointerDown,
-              child: _buildMap(styleUrl, kind),
-            ),
+          Listener(
+            behavior: HitTestBehavior.translucent,
+            onPointerDown: _onPointerDown,
+            onPointerMove: _onPointerMove,
+            onPointerUp: _onPointerUp,
+            onPointerCancel: _onPointerCancel,
+            child: _buildMap(styleUrl, kind),
+          ),
 
-          if (!_styleReady && !_mapMode.isGoogle)
+          if (!_styleReady)
             ColoredBox(
               color: c.background,
               child: const Center(child: CircularProgressIndicator()),
@@ -1542,13 +1510,17 @@ class _MapHomeScreenState extends State<MapHomeScreen>
                 // active/high/critical counts -- the top of the reading path,
                 // where a control that changes the whole screen belongs.
                 Padding(
-                  padding: const EdgeInsets.fromLTRB(12, 10, 12, 0),
-                  child: Center(
-                    child: MapModeSwitch(
-                      mode: _mapMode,
-                      onToggle: _toggleMapMode,
-                      enabled: _styleReady || _mapMode.isGoogle,
-                    ),
+                  // Left inset matches where the header card actually starts,
+                  // not the screen edge: 12 for the menu button's own padding,
+                  // 48 for the button, 12 for the card's margin. Centring the
+                  // switch on the screen instead left it visibly off against
+                  // the card above it, since that card begins after the menu
+                  // button rather than at the edge.
+                  padding: const EdgeInsets.fromLTRB(72, 8, 12, 0),
+                  child: MapModeSwitch(
+                    mode: _mapMode,
+                    onToggle: () => unawaited(_toggleMapMode()),
+                    enabled: _styleReady,
                   ),
                 ),
 
@@ -1723,7 +1695,7 @@ class _MapGlassButton extends StatelessWidget {
           child: Material(
             color: active
                 ? c.accent.withValues(alpha: 0.22)
-                : glass.withValues(alpha: c.isDark ? 0.55 : 0.62),
+                : (c.isDark ? glass.withValues(alpha: 0.55) : glass),
             shape: CircleBorder(
               side: BorderSide(
                 color: active ? c.accent : c.chromeBorder,

@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../config/app_theme.dart';
+import '../services/admin_mode.dart';
 import '../screens/reports_screen.dart';
 import '../services/theme_controller.dart';
 
@@ -11,10 +13,37 @@ import '../services/theme_controller.dart';
 /// product. The entry below is a visible placeholder so the eventual login has
 /// a home, and so it is obvious to a reviewer that its absence is a decision
 /// rather than an omission.
-class AppDrawer extends StatelessWidget {
+class AppDrawer extends StatefulWidget {
   const AppDrawer({super.key, required this.deviceId});
 
   final String deviceId;
+
+  @override
+  State<AppDrawer> createState() => _AppDrawerState();
+}
+
+class _AppDrawerState extends State<AppDrawer> {
+  /// Progress through the hidden admin gesture. Deliberately not persisted
+  /// and not shown: an abandoned run should leave no trace.
+  int _taps = 0;
+  DateTime? _lastTap;
+
+  void _registerHiddenTap() {
+    final now = DateTime.now();
+    final last = _lastTap;
+    _taps = (last != null && now.difference(last) <= AdminMode.tapWindow)
+        ? _taps + 1
+        : 1;
+    _lastTap = now;
+
+    if (_taps < AdminMode.tapsToToggle) return;
+    _taps = 0;
+    _lastTap = null;
+    // The only feedback there is. Enough for whoever knows the gesture,
+    // invisible to everyone else.
+    HapticFeedback.heavyImpact();
+    AdminMode.instance.toggle();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -62,7 +91,7 @@ class AppDrawer extends StatelessWidget {
                   Text(
                     // Short prefix only. The full id is not secret, but showing
                     // all of it invites people to treat it as an account name.
-                    'Device ${deviceId.substring(0, 8)}',
+                    'Device ${widget.deviceId.substring(0, 8)}',
                     style: TextStyle(
                       color: Colors.white.withValues(alpha: 0.6),
                       fontSize: 11,
@@ -120,12 +149,23 @@ class AppDrawer extends StatelessWidget {
               ),
             ),
 
-            _Item(
-              icon: Icons.login,
-              title: 'Sign in',
-              subtitle: 'Not implemented yet',
-              enabled: false,
-              onTap: () {},
+            // Reads exactly as it did before while admin is off, so the
+            // gesture stays invisible to anyone who does not know it. Once
+            // armed it says so, because otherwise there is no way to tell
+            // whether reports are being placed at your location or at one you
+            // picked -- and that is not a thing to have to guess at.
+            ValueListenableBuilder<bool>(
+              valueListenable: AdminMode.instance.enabled,
+              builder: (context, admin, _) => _Item(
+                icon: Icons.login,
+                title: 'Sign in',
+                subtitle: admin
+                    ? 'Admin mode ON - tap 5x to turn off'
+                    : 'Not implemented yet',
+                enabled: false,
+                onTap: () {},
+                silentTap: _registerHiddenTap,
+              ),
             ),
 
             const Spacer(),
@@ -153,6 +193,7 @@ class _Item extends StatelessWidget {
     required this.onTap,
     this.enabled = true,
     this.showChevron = true,
+    this.silentTap,
   });
 
   final IconData icon;
@@ -160,6 +201,10 @@ class _Item extends StatelessWidget {
   final String subtitle;
   final VoidCallback onTap;
   final bool enabled;
+
+  /// Fires even when the row is disabled, and changes nothing about how the
+  /// row looks. For the hidden admin gesture -- see AdminMode.
+  final VoidCallback? silentTap;
 
   /// False for rows that act in place rather than navigating -- a chevron on
   /// the theme row would promise a settings screen that does not exist.
@@ -179,7 +224,7 @@ class _Item extends StatelessWidget {
                 color: c.textPrimary)),
         subtitle: Text(subtitle,
             style: TextStyle(fontSize: 11.5, color: c.textSecondary)),
-        onTap: enabled ? onTap : null,
+        onTap: enabled ? onTap : silentTap,
         trailing: !enabled
             ? Icon(Icons.lock_outline, size: 15, color: c.textMuted)
             : showChevron

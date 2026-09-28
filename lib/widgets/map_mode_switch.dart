@@ -2,16 +2,22 @@ import 'package:flutter/material.dart';
 
 import '../config/app_theme.dart';
 
-/// Which map is drawn under the chrome.
+/// What the map is drawn on.
+///
+/// Both modes are the SAME MapLibre map -- only the basemap underneath
+/// changes. That is the point: the hazard markers and the road bands stay on
+/// screen either way, so the switch adds real photography to what the app
+/// knows rather than replacing one with the other.
 enum MapMode {
-  /// MapLibre: the corridor styling, the hazard markers, the road bands and
-  /// the 3D craters. Everything RoadScan draws itself.
+  /// The styled vector basemap with the 3D building extrusions.
   roadscan,
 
-  /// Google's map, at exactly the camera the other view was left at.
-  google;
+  /// Aerial imagery. The extruded buildings step aside, because the imagery
+  /// already has the real ones in it and drawing grey blocks on top of
+  /// photographed rooftops doubles them.
+  satellite;
 
-  bool get isGoogle => this == MapMode.google;
+  bool get isSatellite => this == MapMode.satellite;
 
   /// What the button says: the mode it switches TO, not the one you are in.
   ///
@@ -19,12 +25,12 @@ enum MapMode {
   /// button reading "3D model view" could equally mean "you are here" or
   /// "go here". Naming the destination leaves no room for that.
   String get switchLabel =>
-      isGoogle ? 'Switch to 3D model view' : 'Switch to Google view';
+      isSatellite ? 'Switch to 3D model view' : 'Switch to satellite view';
 
   IconData get switchIcon =>
-      isGoogle ? Icons.view_in_ar_outlined : Icons.public;
+      isSatellite ? Icons.map_outlined : Icons.satellite_alt;
 
-  MapMode get other => isGoogle ? MapMode.roadscan : MapMode.google;
+  MapMode get other => isSatellite ? MapMode.roadscan : MapMode.satellite;
 }
 
 /// The view toggle, directly under the area header.
@@ -65,7 +71,8 @@ class MapModeSwitch extends StatelessWidget {
             border: Border.all(color: c.chromeBorder),
           ),
           child: Row(
-            mainAxisSize: MainAxisSize.min,
+            // Fills the width it is given so its edges line up with the
+            // header card above, rather than shrinking to its text.
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
               Icon(

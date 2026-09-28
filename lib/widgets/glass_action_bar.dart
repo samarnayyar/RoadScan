@@ -54,7 +54,17 @@ class GlassActionBar extends StatelessWidget {
           filter: ui.ImageFilter.blur(sigmaX: 34, sigmaY: 34),
           child: Container(
             decoration: BoxDecoration(
-              color: glass.withValues(alpha: c.isDark ? 0.42 : 0.50),
+              // Opaque in the light theme.
+              //
+              // At 50% the white read as grey the moment there was anything
+              // but pale map behind it, and over satellite imagery it went
+              // visibly darker than the button rail beside it -- the same
+              // chrome in two different shades. The dark theme keeps its
+              // translucency because a dark panel over a dark map still
+              // reads as one surface.
+              color: c.isDark
+                  ? glass.withValues(alpha: 0.42)
+                  : glass,
               borderRadius: BorderRadius.circular(26),
               // Contrasts with the MAP underneath, not with a panel: dark
               // hairline in light mode, light hairline in dark mode.

@@ -108,13 +108,46 @@ class MapLayers {
   static Future<void> addRoadContrast(
     MapLibreMapController c, {
     bool neon = false,
+    bool satellite = false,
+    bool darkBase = true,
   }) async {
     await _dropLayer(c, '$roadsLayerId-glow');
     await _dropLayer(c, roadsLayerId);
 
+    // Anchored directly BENEATH the hazard bands, and above everything else.
+    //
+    // This layer is rebuilt whenever the basemap mode changes, and a plain add
+    // puts it on top of the whole stack -- which looked right over the
+    // corridor but silently covered the red alert bands. They were still being
+    // drawn; there was just a white line on top of them.
+    //
+    // Below the corridor is not the answer either: the white core over the
+    // amber casing is the look worth keeping. So it goes between the two --
+    // over the corridor, under the alerts. Null on the very first pass, when
+    // none of these exist yet, and appending is correct then because
+    // everything else is added after.
+    final below = await _firstExisting(c, const [
+      HazardZone.glowLayerId,
+      pinLayerId,
+      areaLabelLayerId,
+    ]);
+
+    // Over imagery the road network is the ONLY road network: the satellite
+    // raster sits above the basemap, so everything `liberty` or `dark` drew
+    // is hidden underneath it and this layer has to carry the streets on its
+    // own. That changes what the colour is for. On the vector basemap these
+    // lines are a contrast boost over a background tuned to them, so they can
+    // be blue or cyan; over a photograph they are the streets themselves, and
+    // a cyan web laid across aerial imagery reads as a data overlay rather
+    // than as roads. Neutral instead: white where the theme is light, black
+    // where it is dark, both of which the imagery carries cleanly.
+
     // Neon carries the launch screen's glowing-network look onto the map: a
     // wide, low-opacity halo under a bright core, same idea as the area cards.
-    if (neon) {
+    // The neon halo is skipped over imagery -- it is the loudest part of the
+    // effect and has nothing to glow against once there is a photograph
+    // underneath it.
+    if (neon && !satellite) {
       await c.addLineLayer(
         _vectorSourceId,
         '$roadsLayerId-glow',
@@ -144,6 +177,7 @@ class MapLayers {
           lineCap: 'round',
           lineJoin: 'round',
         ),
+        belowLayerId: below,
         sourceLayer: _transportSourceLayer,
         // Legacy filter form: the property is a bare string, NOT ['get',...].
         // The expression form is silently rejected by the Android binding with
@@ -157,8 +191,15 @@ class MapLayers {
       _vectorSourceId,
       roadsLayerId,
       LineLayerProperties(
-        lineColor: neon
-            ? [
+        lineColor: satellite
+            // Grey, not black. Near-black roads over imagery read as holes
+            // punched in the photograph, and they vanish entirely where the
+            // picture is dark -- which over this corridor is most of it,
+            // because it is forest. A mid slate keeps the network legible on
+            // both tree canopy and bare sand.
+            ? (darkBase ? '#525A66' : '#FFFFFF')
+            : neon
+                ? [
                 'match',
                 ['get', 'class'],
                 'motorway', '#B8F4FF',
@@ -167,15 +208,15 @@ class MapLayers {
                 'secondary', '#5FE2FF',
                 '#3FD4F5',
               ]
-            : [
-                'match',
-                ['get', 'class'],
-                'motorway', '#7FB2D9',
-                'trunk', '#7FB2D9',
-                'primary', '#6E9CC4',
-                'secondary', '#5D86AB',
-                '#4A6B88', // everything else: residential, service, track
-              ],
+                : [
+                    'match',
+                    ['get', 'class'],
+                    'motorway', '#7FB2D9',
+                    'trunk', '#7FB2D9',
+                    'primary', '#6E9CC4',
+                    'secondary', '#5D86AB',
+                    '#4A6B88', // residential, service, track
+                  ],
         lineWidth: [
           'interpolate',
           ['exponential', 1.5],
@@ -190,10 +231,18 @@ class MapLayers {
           16, 3.4,
           19, 7.0,
         ],
-        lineOpacity: neon ? 0.95 : 0.85,
+        // A touch translucent over imagery so the road surface underneath
+        // still shows through and the line reads as tracing a real road
+        // rather than painting over it.
+        lineOpacity: satellite
+            ? 0.82
+            : neon
+                ? 0.95
+                : 0.85,
         lineCap: 'round',
         lineJoin: 'round',
       ),
+      belowLayerId: below,
       sourceLayer: _transportSourceLayer,
       // Paths and steps are not driveable and would only add clutter.
       // Legacy filter form -- see the note on the glow layer above.
@@ -652,10 +701,15 @@ class MapLayers {
   static Future<void> addCorridor(MapLibreMapController c) async {
     final geo = await _corridorGeoJson();
 
-    // The hazard zones are stretches OF this route, so they are snapped
-    // against the same geometry rather than a second copy that could drift
-    // out of step with it.
-    HazardZone.loadRoutes(geo);
+    // Hazard bands snap against the full OSM network rather than this
+    // corridor: the corridor is one route, and a report can be on any road.
+    try {
+      final raw = await rootBundle.loadString('assets/roads.geojson');
+      HazardZone.loadRoadNetwork(json.decode(raw) as Map<String, dynamic>);
+    } catch (e) {
+      // Corridor bands still work; only side-road hazards lose theirs.
+      debugPrint('RoadScan: road network unavailable: $e');
+    }
 
     for (final id in const [
       corridorSpurLayerId,
@@ -1383,18 +1437,11 @@ class MapLayers {
         // corridor map the cluster IS the information.
         iconAllowOverlap: true,
         iconIgnorePlacement: true,
-        // Fades out as the 3D crater takes over. Zoomed out the marker is the
-        // only thing showing the hazard; zoomed in it would stand on top of
-        // the crater it is pointing at. The symbol is still rendered and
-        // still tappable at zero opacity, and the crater rim is a tap target
-        // too.
-        iconOpacity: [
-          'interpolate',
-          ['linear'],
-          ['zoom'],
-          17.8, ['get', 'opacity'],
-          18.8, 0.0,
-        ],
+        // Constant. This used to fade to nothing by z18.8, because the 3D
+        // crater was meant to take over from the marker at close range --
+        // with the crater gone that would simply erase the pin exactly when
+        // the user has zoomed in to look at it.
+        iconOpacity: ['get', 'opacity'],
       ),
     );
   }

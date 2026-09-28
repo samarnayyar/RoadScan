@@ -6,6 +6,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/painting.dart';
 import 'package:flutter_image_compress/flutter_image_compress.dart';
 import 'package:image_picker/image_picker.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:exif/exif.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
@@ -98,6 +99,10 @@ class PhotoMetadataService {
   static const int _quality = 85;
 
   Future<PhotoMetadata?> pick(ImageSource source) async {
+    if (source == ImageSource.gallery) {
+      await _ensureMediaLocation();
+    }
+
     // NOTE: no maxWidth / imageQuality here, deliberately. See class docs.
     final shot = await _picker.pickImage(
       source: source,
@@ -112,6 +117,34 @@ class PhotoMetadataService {
     await _compress(original, meta);
 
     return meta;
+  }
+
+  /// Asks for ACCESS_MEDIA_LOCATION before opening the gallery.
+  ///
+  /// Without this a geotagged photo loses its GPS on the way in, silently.
+  /// From Android 10 the media store REDACTS location from anything the
+  /// picker hands over unless this permission is held, so the file that
+  /// arrives has no GPS tags at all -- not a parse failure, just an absence,
+  /// which looks identical to a photo that was never geotagged. The report
+  /// then falls back to wherever the phone is now, which for an upload is
+  /// usually not where the photo was taken.
+  ///
+  /// Declaring it in the manifest is not enough; it is a runtime permission.
+  /// It was declared and never requested, so the EXIF path below was dead for
+  /// every gallery upload on this phone.
+  ///
+  /// Only for the gallery. A photo taken through the camera in this app never
+  /// passes through the media store, so it keeps its metadata regardless.
+  Future<void> _ensureMediaLocation() async {
+    try {
+      final status = await Permission.accessMediaLocation.status;
+      if (status.isGranted) return;
+      // Denial is not fatal: the upload still works, it just falls back to
+      // live GPS, which is what happened before this existed.
+      await Permission.accessMediaLocation.request();
+    } catch (e) {
+      debugPrint('RoadScan: media location permission unavailable: $e');
+    }
   }
 
   /// Pulls capture time and GPS out of the original file.
